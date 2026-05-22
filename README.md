@@ -1,5 +1,9 @@
 # dataexchange
 
+[![ci](https://github.com/pilot-protocol/dataexchange/actions/workflows/ci.yml/badge.svg)](https://github.com/pilot-protocol/dataexchange/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/pilot-protocol/dataexchange/branch/main/graph/badge.svg)](https://codecov.io/gh/pilot-protocol/dataexchange)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+
 Data-exchange plugin for the Pilot Protocol daemon. Listens on port 1001
 and persists inbound frames under `~/.pilot/`: files land in `received/`
 and text/JSON/binary messages land in `inbox/`.
@@ -48,3 +52,7 @@ Max frame size: 256 MiB.
 | Tag | Effect |
 |---|---|
 | `no_dataexchange` | Compiles a no-op stub whose `Start` does nothing. Useful for integration tests that don't want inbox files written. |
+
+## License
+
+AGPL-3.0-or-later. See [LICENSE](LICENSE).
