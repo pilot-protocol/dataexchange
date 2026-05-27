@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -30,7 +31,19 @@ type ServiceConfig struct {
 	// payloads (e.g. zlib-compressed envelopes) need to round-trip
 	// without UTF-8 mangling.
 	IncludeBase64 bool
+	// InboxMaxFiles caps the number of inbox files retained on disk.
+	// On exceeding the cap, oldest files (by mtime) are evicted FIFO.
+	// Zero or negative ⇒ default 10000. Without this cap, a
+	// misbehaving peer or sustained inbound load fills the operator's
+	// disk indefinitely.
+	InboxMaxFiles int
 }
+
+// inboxEvictCheckEvery: only run the eviction-scan once every N saves
+// — full readdir + sort is O(n log n), so we don't want it on every
+// write. The cap is a soft cap; transient overshoot of up to this
+// many files between checks is acceptable.
+const inboxEvictCheckEvery = 64
 
 // Service is the L11 plugin adapter. Daemon (L7) holds it only as
 // coreapi.Service; cmd/daemon/main.go (L12) constructs it.
@@ -268,5 +281,55 @@ func (s *Service) saveInboxMessage(frame *Frame, from protocol.Addr) error {
 			"size": len(frame.Payload),
 		})
 	}
+	// Periodic eviction so a misbehaving peer (or sustained inbound
+	// load) cannot fill the operator's disk. We sample every
+	// inboxEvictCheckEvery writes — the cap is soft.
+	if seq%inboxEvictCheckEvery == 0 {
+		s.evictInboxOverflow(dir)
+	}
 	return nil
+}
+
+// evictInboxOverflow trims the inbox to at most cfg.InboxMaxFiles by
+// deleting the oldest files (by mtime). Best-effort: I/O errors are
+// logged and the loop continues. Called periodically from
+// saveInboxMessage.
+func (s *Service) evictInboxOverflow(dir string) {
+	cap := s.cfg.InboxMaxFiles
+	if cap <= 0 {
+		cap = 10000
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		slog.Debug("inbox evict: readdir", "dir", dir, "err", err)
+		return
+	}
+	if len(entries) <= cap {
+		return
+	}
+	type aged struct {
+		name string
+		mod  time.Time
+	}
+	files := make([]aged, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, aged{name: e.Name(), mod: info.ModTime()})
+	}
+	if len(files) <= cap {
+		return
+	}
+	// Oldest first.
+	sort.Slice(files, func(i, j int) bool { return files[i].mod.Before(files[j].mod) })
+	toEvict := len(files) - cap
+	for i := 0; i < toEvict; i++ {
+		_ = os.Remove(filepath.Join(dir, files[i].name))
+	}
+	slog.Info("inbox eviction", "dir", dir, "evicted", toEvict, "remaining", cap)
 }
