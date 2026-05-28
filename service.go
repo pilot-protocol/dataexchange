@@ -304,7 +304,16 @@ func (s *Service) evictInboxOverflow(dir string) {
 		slog.Debug("inbox evict: readdir", "dir", dir, "err", err)
 		return
 	}
-	if len(entries) <= cap {
+	// Only count regular files against the cap;
+	// subdirectories (e.g. conversation folders) must
+	// not poison the eviction trigger.
+	fileCnt := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			fileCnt++
+		}
+	}
+	if fileCnt <= cap {
 		return
 	}
 	type aged struct {
