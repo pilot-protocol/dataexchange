@@ -179,6 +179,13 @@ func (s *Service) handleConn(ctx context.Context, conn coreapi.Stream) {
 			ackFrame = &Frame{Type: TypeText, Payload: []byte(ackMsg)}
 		}
 		if err := WriteFrame(conn, ackFrame); err != nil {
+			if s.deps.Events != nil {
+				s.deps.Events.Publish("dataexchange.ack_failed", map[string]any{
+					"remote":     conn.RemoteAddr(),
+					"frame_type": TypeName(frame.Type),
+					"error":      err.Error(),
+				})
+			}
 			return
 		}
 	}
