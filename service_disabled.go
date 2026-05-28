@@ -13,7 +13,7 @@ package dataexchange
 import (
 	"context"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/coreapi"
+	"github.com/pilot-protocol/common/coreapi"
 )
 
 // ServiceConfig mirrors the real ServiceConfig so cmd/daemon's

@@ -5,8 +5,8 @@ package dataexchange
 import (
 	"time"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/driver"
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
+	"github.com/pilot-protocol/common/driver"
+	"github.com/pilot-protocol/common/protocol"
 )
 
 // Client connects to a remote data exchange service on port 1001.

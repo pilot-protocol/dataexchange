@@ -17,8 +17,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/coreapi"
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
+	"github.com/pilot-protocol/common/coreapi"
+	"github.com/pilot-protocol/common/protocol"
 )
 
 // ServiceConfig configures the daemon-side dataexchange handler. Both
