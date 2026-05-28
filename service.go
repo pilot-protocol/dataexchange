@@ -295,16 +295,16 @@ func (s *Service) saveInboxMessage(frame *Frame, from protocol.Addr) error {
 // logged and the loop continues. Called periodically from
 // saveInboxMessage.
 func (s *Service) evictInboxOverflow(dir string) {
-	cap := s.cfg.InboxMaxFiles
-	if cap <= 0 {
-		cap = 10000
+	maxFiles := s.cfg.InboxMaxFiles
+	if maxFiles <= 0 {
+		maxFiles = 10000
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		slog.Debug("inbox evict: readdir", "dir", dir, "err", err)
 		return
 	}
-	if len(entries) <= cap {
+	if len(entries) <= maxFiles {
 		return
 	}
 	type aged struct {
@@ -322,14 +322,14 @@ func (s *Service) evictInboxOverflow(dir string) {
 		}
 		files = append(files, aged{name: e.Name(), mod: info.ModTime()})
 	}
-	if len(files) <= cap {
+	if len(files) <= maxFiles {
 		return
 	}
 	// Oldest first.
 	sort.Slice(files, func(i, j int) bool { return files[i].mod.Before(files[j].mod) })
-	toEvict := len(files) - cap
+	toEvict := len(files) - maxFiles
 	for i := 0; i < toEvict; i++ {
 		_ = os.Remove(filepath.Join(dir, files[i].name))
 	}
-	slog.Info("inbox eviction", "dir", dir, "evicted", toEvict, "remaining", cap)
+	slog.Info("inbox eviction", "dir", dir, "evicted", toEvict, "remaining", maxFiles)
 }
