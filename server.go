@@ -6,8 +6,8 @@ import (
 	"log/slog"
 	"net"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/driver"
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
+	"github.com/pilot-protocol/common/driver"
+	"github.com/pilot-protocol/common/protocol"
 )
 
 // Handler is called for each incoming frame on a connection.

@@ -14,8 +14,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/coreapi"
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
+	"github.com/pilot-protocol/common/coreapi"
+	"github.com/pilot-protocol/common/protocol"
 )
 
 // TestTypeName covers every branch of the human-readable type mapping.

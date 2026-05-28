@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/driver"
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
+	"github.com/pilot-protocol/common/driver"
+	"github.com/pilot-protocol/common/protocol"
 )
 
 // ---- IPC wire constants (mirror unexported driver.cmd* by value) -----------
