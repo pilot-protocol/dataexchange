@@ -24,6 +24,12 @@ jobs:
           repository: TeoSlayer/pilotprotocol
           path: web4
 
+      - name: Checkout common
+        uses: actions/checkout@v4
+        with:
+          repository: pilot-protocol/common
+          path: common
+
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25'
