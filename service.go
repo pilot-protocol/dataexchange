@@ -37,6 +37,11 @@ type ServiceConfig struct {
 	// misbehaving peer or sustained inbound load fills the operator's
 	// disk indefinitely.
 	InboxMaxFiles int
+	// InboxMaxBytes caps the total on-disk bytes used by the inbox.
+	// When > 0, saveInboxMessage checks the accumulated size before
+	// every write and evictExpandOverflow uses bytes instead of file
+	// count. Zero ⇒ no byte cap (backward-compatible).
+	InboxMaxBytes int64
 }
 
 // inboxEvictCheckEvery: only run the eviction-scan once every N saves
@@ -259,6 +264,35 @@ func (s *Service) saveInboxMessage(frame *Frame, from protocol.Addr) error {
 		return fmt.Errorf("mkdir: %w", err)
 	}
 
+	// Byte-budget check: if InboxMaxBytes is set, confirm there is room
+	// BEFORE writing. Evict if over, then re-check.
+	if s.cfg.InboxMaxBytes > 0 {
+		current, _ := inboxTotalBytes(dir)
+		// Estimate the JSON overhead: type, from, data, bytes, received_at,
+		// and possibly data_b64.
+		estimated := int64(len(frame.Payload)) + 256
+		if current+estimated > s.cfg.InboxMaxBytes {
+			s.evictInboxOverflowByBytes(dir)
+			after, _ := inboxTotalBytes(dir)
+			if after+estimated > s.cfg.InboxMaxBytes {
+				slog.Warn("inbox byte budget exceeded after eviction",
+					"current_bytes", after,
+					"max_bytes", s.cfg.InboxMaxBytes,
+					"frame_bytes", len(frame.Payload))
+				if s.deps.Events != nil {
+					s.deps.Events.Publish("inbox.full", map[string]any{
+						"from":         from.String(),
+						"type":         TypeName(frame.Type),
+						"frame_bytes":  len(frame.Payload),
+						"max_bytes":    s.cfg.InboxMaxBytes,
+					})
+				}
+				return fmt.Errorf("inbox byte budget exceeded: %d + %d > %d",
+					after, estimated, s.cfg.InboxMaxBytes)
+			}
+		}
+	}
+
 	ts := time.Now()
 	msg := map[string]interface{}{
 		"type":        TypeName(frame.Type),
@@ -298,10 +332,16 @@ func (s *Service) saveInboxMessage(frame *Frame, from protocol.Addr) error {
 }
 
 // evictInboxOverflow trims the inbox to at most cfg.InboxMaxFiles by
-// deleting the oldest files (by mtime). Best-effort: I/O errors are
-// logged and the loop continues. Called periodically from
-// saveInboxMessage.
+// deleting the oldest files (by mtime). When InboxMaxBytes > 0, the
+// eviction target is total bytes rather than file count. Best-effort:
+// I/O errors are logged and the loop continues. Called periodically
+// from saveInboxMessage.
 func (s *Service) evictInboxOverflow(dir string) {
+	// Byte-based eviction when InboxMaxBytes is configured.
+	if s.cfg.InboxMaxBytes > 0 {
+		s.evictInboxOverflowByBytes(dir)
+		return
+	}
 	maxFiles := s.cfg.InboxMaxFiles
 	if maxFiles <= 0 {
 		maxFiles = 10000
@@ -339,4 +379,67 @@ func (s *Service) evictInboxOverflow(dir string) {
 		_ = os.Remove(filepath.Join(dir, files[i].name))
 	}
 	slog.Info("inbox eviction", "dir", dir, "evicted", toEvict, "remaining", maxFiles)
+}
+
+// evictInboxOverflowByBytes trims total inbox size to InboxMaxBytes.
+func (s *Service) evictInboxOverflowByBytes(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		slog.Debug("inbox evict: readdir", "dir", dir, "err", err)
+		return
+	}
+	type aged struct {
+		name string
+		mod  time.Time
+		size int64
+	}
+	files := make([]aged, 0, len(entries))
+	var total int64
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		sz := info.Size()
+		files = append(files, aged{name: e.Name(), mod: info.ModTime(), size: sz})
+		total += sz
+	}
+	if total <= s.cfg.InboxMaxBytes {
+		return
+	}
+	// Oldest first.
+	sort.Slice(files, func(i, j int) bool { return files[i].mod.Before(files[j].mod) })
+	evicted := 0
+	for i := 0; i < len(files) && total > s.cfg.InboxMaxBytes; i++ {
+		p := filepath.Join(dir, files[i].name)
+		if err := os.Remove(p); err != nil {
+			continue
+		}
+		total -= files[i].size
+		evicted++
+	}
+	slog.Info("inbox eviction (bytes)", "dir", dir, "evicted", evicted, "total_bytes_after", total, "max_bytes", s.cfg.InboxMaxBytes)
+}
+
+// inboxTotalBytes sums the on-disk size of all regular files in dir.
+func inboxTotalBytes(dir string) (int64, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, err
+	}
+	var total int64
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		total += info.Size()
+	}
+	return total, nil
 }

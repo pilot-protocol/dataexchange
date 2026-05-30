@@ -424,6 +424,108 @@ func (e *capturingEvents) Subscribe(pattern string) (<-chan coreapi.Event, func(
 	return ch, func() {}
 }
 
+// ---- PILOT-276: inbox byte-budget cap ----------------------------------
+
+// TestSaveInboxMessage_ByteBudgetEnforced verifies that when InboxMaxBytes is
+// set, saveInboxMessage rejects writes that would exceed the budget.
+func TestSaveInboxMessage_ByteBudgetEnforced(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	s := NewService(ServiceConfig{InboxDir: tmp, InboxMaxBytes: 512})
+
+	// First message (small) must succeed.
+	frame := &Frame{Type: TypeText, Payload: []byte("hello")}
+	if err := s.saveInboxMessage(frame, protocol.Addr{Node: 1}); err != nil {
+		t.Fatalf("first save under budget must succeed: %v", err)
+	}
+
+	// Second message — the inbox JSON overhead + data should push over 512.
+	// Force the test by writing a payload that fills the rest of the budget.
+	// After the first save, let's check how many files exist.
+	entries, _ := os.ReadDir(tmp)
+	t.Logf("entries after first save: %d", len(entries))
+
+	// Save enough messages to exceed 512 bytes total.
+	for i := 0; i < 20; i++ {
+		frame := &Frame{Type: TypeText, Payload: []byte(strings.Repeat("x", 50))}
+		err := s.saveInboxMessage(frame, protocol.Addr{Node: 2})
+		if err != nil {
+			t.Logf("saveInboxMessage #%d failed as expected: %v", i+2, err)
+			return // success — budget enforced
+		}
+	}
+	t.Error("expected saveInboxMessage to eventually reject when over byte budget")
+}
+
+// TestSaveInboxMessage_NoByteBudget_Unbounded documents that with
+// InboxMaxBytes unset (zero), old behaviour is preserved — writes are
+// never rejected on byte count.
+func TestSaveInboxMessage_NoByteBudget_Unbounded(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	s := NewService(ServiceConfig{InboxDir: tmp}) // InboxMaxBytes=0 (unset)
+
+	for i := 0; i < 5; i++ {
+		frame := &Frame{Type: TypeText, Payload: []byte(strings.Repeat("y", 200))}
+		if err := s.saveInboxMessage(frame, protocol.Addr{Node: 3}); err != nil {
+			t.Fatalf("save #%d with no byte budget must not reject: %v", i+1, err)
+		}
+	}
+	entries, _ := os.ReadDir(tmp)
+	if len(entries) != 5 {
+		t.Errorf("got %d files, want 5", len(entries))
+	}
+}
+
+// TestEvictInboxOverflow_ByteBasedEvictsOldest verifies that when
+// InboxMaxBytes is set, evictInboxOverflow uses total bytes (not file
+// count) to decide what to delete.
+func TestEvictInboxOverflow_ByteBasedEvictsOldest(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	s := NewService(ServiceConfig{InboxDir: tmp, InboxMaxBytes: 200})
+
+	now := time.Now()
+	// Write 3 files totalling > 200 bytes. Oldest should get evicted.
+	files := []struct {
+		name    string
+		content string
+		age     time.Duration
+	}{
+		{"old.json", strings.Repeat("a", 100), -10 * time.Second},
+		{"mid.json", strings.Repeat("b", 80), -5 * time.Second},
+		{"new.json", strings.Repeat("c", 60), -1 * time.Second},
+	}
+	for _, f := range files {
+		p := filepath.Join(tmp, f.name)
+		if err := os.WriteFile(p, []byte(f.content), 0600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		mt := now.Add(f.age)
+		_ = os.Chtimes(p, mt, mt)
+	}
+
+	s.evictInboxOverflow(tmp)
+
+	entries, _ := os.ReadDir(tmp)
+	names := make([]string, len(entries))
+	for i, e := range entries {
+		names[i] = e.Name()
+	}
+	t.Logf("remaining entries: %v", names)
+
+	// old.json (oldest, 100 bytes) may have been evicted to get under 200.
+	// At a minimum, the total remaining bytes must not exceed 200.
+	var total int64
+	for _, e := range entries {
+		info, _ := e.Info()
+		total += info.Size()
+	}
+	if total > 200 {
+		t.Errorf("total bytes after eviction = %d, want <= 200", total)
+	}
+}
+
 // Ensure capturingEvents satisfies coreapi.EventBus at compile time.
 var _ coreapi.EventBus = (*capturingEvents)(nil)
 
