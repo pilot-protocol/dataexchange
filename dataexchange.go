@@ -8,6 +8,7 @@ import (
 	"io"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 )
 
 // Frame types for data exchange on port 1001.
@@ -117,7 +118,11 @@ func ReadFrame(r io.Reader) (*Frame, error) {
 			if nameLen > maxFilenameLen {
 				return nil, fmt.Errorf("filename too long: %d bytes (max %d)", nameLen, maxFilenameLen)
 			}
-			name := string(payload[2 : 2+nameLen])
+			nameBytes := payload[2 : 2+nameLen]
+			if !utf8.Valid(nameBytes) {
+				return nil, fmt.Errorf("filename contains invalid UTF-8")
+			}
+			name := string(nameBytes)
 			if strings.ContainsAny(name, "/\\") {
 				return nil, fmt.Errorf("invalid filename: path traversal characters not allowed")
 			}
