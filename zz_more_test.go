@@ -5,6 +5,7 @@ package dataexchange
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -252,12 +253,25 @@ func TestService_SaveInboxMessage_WritesJSON(t *testing.T) {
 			if msg["type"] != "TEXT" {
 				t.Errorf("type = %v, want TEXT", msg["type"])
 			}
-			if msg["data"] != "hello" {
-				t.Errorf("data = %v, want hello", msg["data"])
-			}
-			_, hasB64 := msg["data_b64"]
-			if hasB64 != b64 {
-				t.Errorf("has data_b64 = %v, want %v", hasB64, b64)
+			if b64 {
+				// When IncludeBase64 is true, data_b64 is the canonical field;
+				// data must NOT be present to avoid 2× payload blowup.
+				if _, hasRaw := msg["data"]; hasRaw {
+					t.Errorf("data = %v, want absent when IncludeBase64=true", msg["data"])
+				}
+				b64Val, hasB64 := msg["data_b64"]
+				if !hasB64 {
+					t.Error("data_b64 missing when IncludeBase64=true")
+				} else if b64Val != base64.StdEncoding.EncodeToString([]byte("hello")) {
+					t.Errorf("data_b64 = %v, want %q", b64Val, base64.StdEncoding.EncodeToString([]byte("hello")))
+				}
+			} else {
+				if msg["data"] != "hello" {
+					t.Errorf("data = %v, want hello", msg["data"])
+				}
+				if _, hasB64 := msg["data_b64"]; hasB64 {
+					t.Error("data_b64 present when IncludeBase64=false")
+				}
 			}
 		})
 	}
