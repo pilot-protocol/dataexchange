@@ -247,3 +247,31 @@ func TestFrameFileEmptyName(t *testing.T) {
 		t.Fatalf("payload: expected %q, got %q", "data", string(got.Payload))
 	}
 }
+
+func TestFrameFileInvalidUTF8(t *testing.T) {
+	t.Parallel()
+	// Craft raw wire bytes for a FILE frame with invalid UTF-8 filename.
+	// Wire format: [4B type=FILE][4B payload_len][2B name_len][name_bytes][file_data]
+	invalidName := []byte{0xFF, 0xFE, 0xFD} // invalid UTF-8
+	fileData := []byte("hello")
+	innerPayload := make([]byte, 2+len(invalidName)+len(fileData))
+	innerPayload[0] = byte(len(invalidName) >> 8)
+	innerPayload[1] = byte(len(invalidName))
+	copy(innerPayload[2:], invalidName)
+	copy(innerPayload[2+len(invalidName):], fileData)
+
+	var buf bytes.Buffer
+	hdr := make([]byte, 8)
+	hdr[0], hdr[1], hdr[2], hdr[3] = 0, 0, 0, 4 // TypeFile
+	hdr[4] = byte(len(innerPayload) >> 24)
+	hdr[5] = byte(len(innerPayload) >> 16)
+	hdr[6] = byte(len(innerPayload) >> 8)
+	hdr[7] = byte(len(innerPayload))
+	buf.Write(hdr)
+	buf.Write(innerPayload)
+
+	_, err := dataexchange.ReadFrame(&buf)
+	if err == nil {
+		t.Fatal("expected error for invalid UTF-8 filename, got nil")
+	}
+}
