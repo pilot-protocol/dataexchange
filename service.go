@@ -297,12 +297,13 @@ func (s *Service) saveInboxMessage(frame *Frame, from protocol.Addr) error {
 	msg := map[string]interface{}{
 		"type":        TypeName(frame.Type),
 		"from":        from.String(),
-		"data":        string(frame.Payload),
 		"bytes":       len(frame.Payload),
 		"received_at": ts.Format(time.RFC3339Nano),
 	}
 	if s.cfg.IncludeBase64 {
 		msg["data_b64"] = base64.StdEncoding.EncodeToString(frame.Payload)
+	} else {
+		msg["data"] = string(frame.Payload)
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {
