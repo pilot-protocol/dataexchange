@@ -33,6 +33,13 @@ func (c *Client) SendJSON(data []byte) error {
 	return WriteFrame(c.conn, &Frame{Type: TypeJSON, Payload: data})
 }
 
+// SendAutoAnswer sends a TypeAutoAnswer request: it opts in to
+// reply-on-connection. The sender should follow this with a bounded Recv to
+// read the reply an --auto-answer receiver writes back on this connection.
+func (c *Client) SendAutoAnswer(text string) error {
+	return WriteFrame(c.conn, &Frame{Type: TypeAutoAnswer, Payload: []byte(text)})
+}
+
 // SendBinary sends a binary frame.
 func (c *Client) SendBinary(data []byte) error {
 	return WriteFrame(c.conn, &Frame{Type: TypeBinary, Payload: data})
@@ -58,6 +65,14 @@ func (c *Client) SendTrace(innerType uint32, data []byte) (sentAtNs int64, err e
 // Recv reads the next frame from the connection.
 func (c *Client) Recv() (*Frame, error) {
 	return ReadFrame(c.conn)
+}
+
+// SetReadDeadline bounds the next Recv. A reply-aware sender uses this to wait
+// a bounded window for a reply-on-connection (signalled by an "ACK+REPLY" ack
+// from an --auto-answer receiver) without blocking forever on a plain receiver
+// that never sends one. Pass the zero time to clear the deadline.
+func (c *Client) SetReadDeadline(t time.Time) error {
+	return c.conn.SetReadDeadline(t)
 }
 
 // Close closes the connection.
