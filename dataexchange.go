@@ -20,6 +20,13 @@ const (
 	// TypeTrace wraps another frame type with nanosecond-precision timing.
 	// Wire layout: [4-byte TypeTrace][4-byte len][4-byte inner_type][8-byte sent_at_ns][inner_payload]
 	TypeTrace uint32 = 5
+	// TypeAutoAnswer is a text request that OPTS IN to reply-on-connection: an
+	// --auto-answer receiver dispatches it and writes the reply back on the same
+	// connection (skipping the inbox, so the responder never double-handles it),
+	// instead of saving it for a dial-back. Plain senders never send this type,
+	// so an auto-answer node serves them through the unchanged inbox→responder
+	// path — which is what lets the new loop be tested without disturbing them.
+	TypeAutoAnswer uint32 = 6
 )
 
 // TraceFrame carries timing metadata around an inner message frame.
@@ -152,6 +159,8 @@ func TypeName(t uint32) string {
 		return "FILE"
 	case TypeTrace:
 		return "TRACE"
+	case TypeAutoAnswer:
+		return "AUTOANSWER"
 	default:
 		return fmt.Sprintf("UNKNOWN(%d)", t)
 	}

@@ -42,7 +42,29 @@ type ServiceConfig struct {
 	// every write and evictExpandOverflow uses bytes instead of file
 	// count. Zero ⇒ no byte cap (backward-compatible).
 	InboxMaxBytes int64
+
+	// ReplyHook, when set, enables reply-on-connection: after an inbound
+	// text/JSON message is saved to the inbox, the hook is invoked and any
+	// returned reply is written back on the SAME open connection (no
+	// dial-back), so senders unreachable for an inbound SYN still get their
+	// answer in their inbox.
+	ReplyHook func(reqType uint32, reqPayload []byte) (replyType uint32, reply []byte, ok bool)
+
+	// AutoAnswer enables one-shot reply-on-connection: the handler keeps the
+	// connection open for a bounded window (autoAnswerWindow) to receive ONE
+	// request, dispatches it via ReplyHook, writes the response on the SAME
+	// connection, then closes — exactly 1 request + 1 response, never looping.
+	// This is what makes it loop-safe even if both peers set AutoAnswer, and
+	// lets a sender's UNMODIFIED daemon receive the answer into its inbox over
+	// the connection it already opened (no dial-back). Only specialised
+	// responder nodes (e.g. list-agents) set this.
+	AutoAnswer bool
 }
+
+// autoAnswerWindow bounds how long an AutoAnswer connection stays open
+// waiting for the request + response. Set >= the responder fetch timeout
+// so the connection never closes before the agent has generated a reply.
+const autoAnswerWindow = 40 * time.Second
 
 // inboxEvictCheckEvery: only run the eviction-scan once every N saves
 // — full readdir + sort is O(n log n), so we don't want it on every
@@ -140,6 +162,22 @@ func (s *Service) handleConn(ctx context.Context, conn coreapi.Stream) {
 			"bytes", len(frame.Payload),
 			"remote", conn.RemoteAddr())
 
+		// isAA gates the reply-on-connection loop to requests that OPTED IN
+		// (TypeAutoAnswer) on a node configured to answer them. Everything else
+		// — every request a current sender makes — flows through the unchanged
+		// inbox→responder path below, so enabling auto-answer cannot disturb
+		// existing traffic. Only when isAA do we skip the inbox, dispatch, reply
+		// on this connection, and close after one cycle.
+		isAA := s.cfg.AutoAnswer && frame.Type == TypeAutoAnswer
+		if isAA {
+			// Bound the connection lifetime: coreapi.Stream has no
+			// SetReadDeadline, so close the stream after autoAnswerWindow if the
+			// dispatch+reply cycle hasn't finished. This is the "window" the
+			// sender has to receive its reply before the connection closes.
+			t := time.AfterFunc(autoAnswerWindow, func() { _ = conn.Close() })
+			defer t.Stop()
+		}
+
 		var saveErr error
 		var ackFrame *Frame
 		switch frame.Type {
@@ -147,8 +185,14 @@ func (s *Service) handleConn(ctx context.Context, conn coreapi.Stream) {
 			if frame.Filename != "" {
 				saveErr = s.saveReceivedFile(frame)
 			}
-		case TypeText, TypeJSON, TypeBinary:
-			saveErr = s.saveInboxMessage(frame, conn.RemoteAddr())
+		case TypeText, TypeJSON, TypeBinary, TypeAutoAnswer:
+			// isAA requests are answered on THIS connection, so they are never
+			// saved (the responder must not also dial them back). A TypeAutoAnswer
+			// frame reaching a node that does NOT auto-answer falls through to a
+			// normal inbox save, so it still gets a dial-back reply.
+			if !isAA {
+				saveErr = s.saveInboxMessage(frame, conn.RemoteAddr())
+			}
 		case TypeTrace:
 			tf, tferr := ReadTracePayload(frame)
 			if tferr != nil {
@@ -180,6 +224,12 @@ func (s *Service) handleConn(ctx context.Context, conn coreapi.Stream) {
 			ackMsg := fmt.Sprintf("ACK %s %d bytes", TypeName(frame.Type), len(frame.Payload))
 			if saveErr != nil {
 				ackMsg = fmt.Sprintf("ERR %s save failed: %v", TypeName(frame.Type), saveErr)
+			} else if isAA {
+				// Confirm to the reply-aware sender that a reply WILL follow on
+				// this same connection. The ack stays fast (written before the
+				// reply is generated); if the agent ultimately produces no reply
+				// the sender's bounded read just times out.
+				ackMsg = fmt.Sprintf("ACK+REPLY %s %d bytes", TypeName(frame.Type), len(frame.Payload))
 			}
 			ackFrame = &Frame{Type: TypeText, Payload: []byte(ackMsg)}
 		}
@@ -192,6 +242,32 @@ func (s *Service) handleConn(ctx context.Context, conn coreapi.Stream) {
 				})
 			}
 			return
+		}
+
+		// reply-on-connection: for an opted-in request, dispatch via ReplyHook
+		// (which delegates to the responder's real service-call logic) and write
+		// the reply back on THIS connection as a normal TEXT frame.
+		if isAA {
+			replied := false
+			if s.cfg.ReplyHook != nil {
+				if _, reply, ok := s.cfg.ReplyHook(frame.Type, frame.Payload); ok && len(reply) > 0 {
+					if werr := WriteFrame(conn, &Frame{Type: TypeText, Payload: reply}); werr != nil {
+						return
+					}
+					replied = true
+				}
+			}
+			if replied {
+				// Graceful close: block until the sender has consumed the reply
+				// and closed its half (ReadFrame returns EOF/err). Closing
+				// immediately after WriteFrame races the reply delivery — an
+				// abortive teardown can drop the in-flight reply (observed
+				// ~50% loss). Waiting for the sender's close guarantees the
+				// pseudo-TCP delivered the reply first. The autoAnswerWindow
+				// watchdog bounds this if a sender never closes its half.
+				_, _ = ReadFrame(conn)
+			}
+			return // one cycle only: 1 request + 1 response, then close
 		}
 	}
 }
