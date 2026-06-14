@@ -11,8 +11,9 @@ import (
 
 // TestReadFrame_SizeCap verifies MaxFrameSize acceptance / rejection.
 // Replaces the core assertion behind test_size_file_500mb_reject.sh —
-// a 500 MiB frame must be rejected cleanly, while frames up to MaxFrameSize
-// (256 MiB) are accepted.
+// a frame past the cap must be rejected cleanly without allocating the
+// payload, while frames up to and including MaxFrameSize are accepted.
+// Default cap was raised from 256 MiB to 1 GiB on 2026-06-14.
 func TestReadFrame_SizeCap(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -25,7 +26,6 @@ func TestReadFrame_SizeCap(t *testing.T) {
 		{"just_under_cap", MaxFrameSize - 1, false},
 		{"at_cap", MaxFrameSize, false},
 		{"just_over_cap", MaxFrameSize + 1, true},
-		{"way_over_cap", 1 << 30, true}, // 1 GiB
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

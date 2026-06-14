@@ -20,10 +20,10 @@ import (
 
 // fakeStream is a coreapi.Stream backed by io.Pipe pairs.
 type fakeStream struct {
-	r          *io.PipeReader
-	w          *io.PipeWriter
-	closed     chan struct{}
-	closeOnce  sync.Once
+	r         *io.PipeReader
+	w         *io.PipeWriter
+	closed    chan struct{}
+	closeOnce sync.Once
 }
 
 func newFakeStream(r *io.PipeReader, w *io.PipeWriter) *fakeStream {
@@ -40,11 +40,11 @@ func (s *fakeStream) Close() error {
 	})
 	return nil
 }
-func (s *fakeStream) LocalAddr() coreapi.Addr        { return protocol.Addr{} }
-func (s *fakeStream) LocalPort() uint16              { return 1001 }
-func (s *fakeStream) RemoteAddr() coreapi.Addr       { return protocol.Addr{Node: 0xCAFE} }
-func (s *fakeStream) RemotePort() uint16             { return 33000 }
-func (s *fakeStream) SetDeadline(time.Time) error    { return nil }
+func (s *fakeStream) LocalAddr() coreapi.Addr          { return protocol.Addr{} }
+func (s *fakeStream) LocalPort() uint16                { return 1001 }
+func (s *fakeStream) RemoteAddr() coreapi.Addr         { return protocol.Addr{Node: 0xCAFE} }
+func (s *fakeStream) RemotePort() uint16               { return 33000 }
+func (s *fakeStream) SetDeadline(time.Time) error      { return nil }
 func (s *fakeStream) SetReadDeadline(time.Time) error  { return nil }
 func (s *fakeStream) SetWriteDeadline(time.Time) error { return nil }
 
@@ -84,7 +84,7 @@ func (l *fakeListener) Port() uint16       { return 1001 }
 
 // fakeStreams returns a programmable listener.
 type fakeStreams struct {
-	listener coreapi.Listener
+	listener  coreapi.Listener
 	listenErr error
 }
 

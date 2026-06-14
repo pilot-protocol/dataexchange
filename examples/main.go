@@ -8,10 +8,10 @@ import (
 	"log"
 	"net"
 
-	internaldx "github.com/pilot-protocol/dataexchange"
 	"github.com/pilot-protocol/common/driver"
 	"github.com/pilot-protocol/common/protocol"
 	"github.com/pilot-protocol/dataexchange"
+	internaldx "github.com/pilot-protocol/dataexchange"
 )
 
 func main() {

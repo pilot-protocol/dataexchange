@@ -281,10 +281,10 @@ func (s *Service) saveInboxMessage(frame *Frame, from protocol.Addr) error {
 					"frame_bytes", len(frame.Payload))
 				if s.deps.Events != nil {
 					s.deps.Events.Publish("inbox.full", map[string]any{
-						"from":         from.String(),
-						"type":         TypeName(frame.Type),
-						"frame_bytes":  len(frame.Payload),
-						"max_bytes":    s.cfg.InboxMaxBytes,
+						"from":        from.String(),
+						"type":        TypeName(frame.Type),
+						"frame_bytes": len(frame.Payload),
+						"max_bytes":   s.cfg.InboxMaxBytes,
 					})
 				}
 				return fmt.Errorf("inbox byte budget exceeded: %d + %d > %d",
