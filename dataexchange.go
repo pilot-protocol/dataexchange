@@ -22,6 +22,16 @@ const (
 	// TypeTrace wraps another frame type with nanosecond-precision timing.
 	// Wire layout: [4-byte TypeTrace][4-byte len][4-byte inner_type][8-byte sent_at_ns][inner_payload]
 	TypeTrace uint32 = 5
+	// Type 6 is reserved (see Alex's reply-on-conn PR chain / TypeAutoAnswer).
+	//
+	// TypeFileStream is the chunked/ACK'd/resumable file-transfer protocol
+	// (see docs/PROPOSAL-reliable-file-transfer.md and filestream.go). Each
+	// TypeFileStream frame carries a small control header + at most one
+	// chunk of file data, so a multi-GiB transfer never collapses into a
+	// single giant frame the way TypeFile does. Backward compatible: a
+	// peer that does not understand TypeFileStream never sends INIT-ACK, so
+	// the sender falls back to TypeFile.
+	TypeFileStream uint32 = 7
 )
 
 // TraceFrame carries timing metadata around an inner message frame.
@@ -186,6 +196,8 @@ func TypeName(t uint32) string {
 		return "FILE"
 	case TypeTrace:
 		return "TRACE"
+	case TypeFileStream:
+		return "FILESTREAM"
 	default:
 		return fmt.Sprintf("UNKNOWN(%d)", t)
 	}
