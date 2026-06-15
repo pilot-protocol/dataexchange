@@ -6,7 +6,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
@@ -20,6 +22,16 @@ const (
 	// TypeTrace wraps another frame type with nanosecond-precision timing.
 	// Wire layout: [4-byte TypeTrace][4-byte len][4-byte inner_type][8-byte sent_at_ns][inner_payload]
 	TypeTrace uint32 = 5
+	// Type 6 is reserved (see Alex's reply-on-conn PR chain / TypeAutoAnswer).
+	//
+	// TypeFileStream is the chunked/ACK'd/resumable file-transfer protocol
+	// (see docs/PROPOSAL-reliable-file-transfer.md and filestream.go). Each
+	// TypeFileStream frame carries a small control header + at most one
+	// chunk of file data, so a multi-GiB transfer never collapses into a
+	// single giant frame the way TypeFile does. Backward compatible: a
+	// peer that does not understand TypeFileStream never sends INIT-ACK, so
+	// the sender falls back to TypeFile.
+	TypeFileStream uint32 = 7
 )
 
 // TraceFrame carries timing metadata around an inner message frame.
@@ -56,10 +68,42 @@ func ReadTracePayload(f *Frame) (*TraceFrame, error) {
 // maxFilenameLen limits filename length to prevent abuse.
 const maxFilenameLen = 255
 
-// MaxFrameSize caps a single data-exchange frame at 256 MiB. Sized to fit
-// the test fleet's 100 MiB file payloads with margin while still rejecting
-// pathological 500 MiB+ frames that would dominate memory.
-const MaxFrameSize = 1 << 28
+// DefaultMaxFrameSize caps a single data-exchange frame at 1 GiB.
+//
+// The wire format's length field is a uint32 (see Frame docstring below),
+// so the absolute ceiling is ~4 GiB; this cap exists purely to bound the
+// memory the receiver allocates for any single transfer. Raising it
+// trades RAM for the ability to ship larger artefacts in one frame.
+//
+// History: was 256 MiB pre-2026-06-14 (sized for the test fleet's 100 MiB
+// payloads). Raised after operators on multi-GiB-RAM hosts hit the cap on
+// real workloads; the chunked streaming protocol described in
+// docs/PROPOSAL-reliable-file-transfer.md (web4) will eventually remove
+// the need for a per-frame cap entirely.
+const DefaultMaxFrameSize uint32 = 1 << 30
+
+// MaxFrameSize is the runtime-effective frame cap. Set at package init
+// from the PILOT_DATAEXCHANGE_MAX_FRAME env var (in bytes) if present
+// and within the safe range [64 KiB, 2 GiB); otherwise DefaultMaxFrameSize.
+//
+// Both ends of a transfer must agree on the cap — a sender that exceeds
+// the receiver's cap will see the receiver return "frame too large" and
+// drop the connection. The env var is honored at process start, so
+// rolling out a higher cap means restarting daemons on both sides.
+var MaxFrameSize uint32 = func() uint32 {
+	v := os.Getenv("PILOT_DATAEXCHANGE_MAX_FRAME")
+	if v == "" {
+		return DefaultMaxFrameSize
+	}
+	n, err := strconv.ParseUint(v, 10, 32)
+	if err != nil || n < 1<<16 || n >= 1<<31 {
+		// Silently ignore garbage / unsafe values rather than crash the
+		// daemon at startup — surface them via the daemon log if the
+		// operator opted in.
+		return DefaultMaxFrameSize
+	}
+	return uint32(n)
+}()
 
 // Frame is a typed data unit exchanged between agents.
 // Wire format: [4-byte type][4-byte length][payload]
@@ -152,6 +196,8 @@ func TypeName(t uint32) string {
 		return "FILE"
 	case TypeTrace:
 		return "TRACE"
+	case TypeFileStream:
+		return "FILESTREAM"
 	default:
 		return fmt.Sprintf("UNKNOWN(%d)", t)
 	}

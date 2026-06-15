@@ -127,6 +127,32 @@ func (s *Service) handleConn(ctx context.Context, conn coreapi.Stream) {
 	// L11 panic boundary: tear down THIS conn only.
 	defer coreapi.RecoverPlugin("dataexchange", "handleConn", s.deps.Events, nil)
 	defer conn.Close()
+
+	// Lazily-constructed TypeFileStream receiver, scoped to this connection.
+	// Final filenames and the file.received event match saveReceivedFile so
+	// the two transfer paths are indistinguishable to consumers.
+	var sr *StreamReceiver
+	defer func() {
+		if sr != nil {
+			sr.Close()
+		}
+	}()
+	streamNameSuffix := func(base string) string {
+		ts := time.Now().Format("20060102-150405.000")
+		seq := s.seq.Add(1)
+		ext := filepath.Ext(base)
+		stem := base[:len(base)-len(ext)]
+		return fmt.Sprintf("%s-%s-%06d%s", stem, ts, seq, ext)
+	}
+	streamOnSaved := func(name, path string, size int64) {
+		slog.Info("file saved (stream)", "path", path, "bytes", size)
+		if s.deps.Events != nil {
+			s.deps.Events.Publish("file.received", map[string]any{
+				"filename": name, "size": int(size), "path": path,
+			})
+		}
+	}
+
 	for {
 		frame, err := ReadFrame(conn)
 		// Capture right after the IO read so receiver-side timestamps are as
@@ -143,6 +169,28 @@ func (s *Service) handleConn(ctx context.Context, conn coreapi.Stream) {
 		var saveErr error
 		var ackFrame *Frame
 		switch frame.Type {
+		case TypeFileStream:
+			// Chunked/resumable transfer. The receiver emits its own
+			// control responses (INIT-ACK / ACK / COMPLETE), so skip the
+			// generic per-frame ACK below.
+			if sr == nil {
+				dir, derr := s.receivedDir()
+				if derr != nil {
+					_ = WriteFrame(conn, &Frame{Type: TypeText, Payload: []byte("ERR received dir: " + derr.Error())})
+					return
+				}
+				if mderr := os.MkdirAll(dir, 0700); mderr != nil {
+					_ = WriteFrame(conn, &Frame{Type: TypeText, Payload: []byte("ERR mkdir: " + mderr.Error())})
+					return
+				}
+				sr = NewStreamReceiver(dir, streamNameSuffix, streamOnSaved)
+			}
+			if resp := sr.HandleFrame(frame); resp != nil {
+				if werr := WriteFrame(conn, resp); werr != nil {
+					return
+				}
+			}
+			continue
 		case TypeFile:
 			if frame.Filename != "" {
 				saveErr = s.saveReceivedFile(frame)
@@ -281,10 +329,10 @@ func (s *Service) saveInboxMessage(frame *Frame, from protocol.Addr) error {
 					"frame_bytes", len(frame.Payload))
 				if s.deps.Events != nil {
 					s.deps.Events.Publish("inbox.full", map[string]any{
-						"from":         from.String(),
-						"type":         TypeName(frame.Type),
-						"frame_bytes":  len(frame.Payload),
-						"max_bytes":    s.cfg.InboxMaxBytes,
+						"from":        from.String(),
+						"type":        TypeName(frame.Type),
+						"frame_bytes": len(frame.Payload),
+						"max_bytes":   s.cfg.InboxMaxBytes,
 					})
 				}
 				return fmt.Errorf("inbox byte budget exceeded: %d + %d > %d",
