@@ -14,8 +14,8 @@ import "testing"
 // review.
 func TestMaxFrameSize_DefaultAndConstants(t *testing.T) {
 	t.Parallel()
-	if DefaultMaxFrameSize != 1<<30 {
-		t.Errorf("DefaultMaxFrameSize = %d; want %d (1 GiB)", DefaultMaxFrameSize, 1<<30)
+	if DefaultMaxFrameSize != 64<<20 {
+		t.Errorf("DefaultMaxFrameSize = %d; want %d (64 MiB)", DefaultMaxFrameSize, 64<<20)
 	}
 	// When PILOT_DATAEXCHANGE_MAX_FRAME is unset (as it is in CI),
 	// MaxFrameSize must equal the default. A non-default value here

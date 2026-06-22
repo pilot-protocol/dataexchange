@@ -43,13 +43,13 @@ import (
 
 // Stream control-frame kinds (the first byte of a TypeFileStream payload).
 const (
-	streamKindInit    byte = 0x01 // sender→receiver: filename, size, full hash, chunk size
-	streamKindChunk   byte = 0x02 // sender→receiver: offset + chunk bytes
-	streamKindAck     byte = 0x03 // receiver→sender: highest contiguous offset received
-	streamKindDone    byte = 0x04 // sender→receiver: end of stream; verify full hash
-	streamKindInitAck byte = 0x05 // receiver→sender: resume offset (presence ⇒ peer supports stream)
+	streamKindInit     byte = 0x01 // sender→receiver: filename, size, full hash, chunk size
+	streamKindChunk    byte = 0x02 // sender→receiver: offset + chunk bytes
+	streamKindAck      byte = 0x03 // receiver→sender: highest contiguous offset received
+	streamKindDone     byte = 0x04 // sender→receiver: end of stream; verify full hash
+	streamKindInitAck  byte = 0x05 // receiver→sender: resume offset (presence ⇒ peer supports stream)
 	streamKindComplete byte = 0x06 // receiver→sender: final status after DONE
-	streamKindAbort   byte = 0x07 // either direction: cancel + reason
+	streamKindAbort    byte = 0x07 // either direction: cancel + reason
 )
 
 // Defaults. Chunk size is deliberately held below 64 KiB: on the Mac↔GCP-VM
@@ -61,11 +61,11 @@ const (
 // blackhole heuristic does not flip the link mid-transfer. Window bounds the
 // in-flight (unacked) bytes; 16 × 48 KiB = 768 KiB.
 const (
-	StreamChunkSize  = 48 * 1024
-	streamWindow     = 16
-	streamNegTimeout = 5 * time.Second  // wait for INIT-ACK before falling back to TypeFile
+	StreamChunkSize   = 48 * 1024
+	streamWindow      = 16
+	streamNegTimeout  = 5 * time.Second  // wait for INIT-ACK before falling back to TypeFile
 	streamStepTimeout = 60 * time.Second // max wait for an ACK / the final COMPLETE
-	transferIDLen    = 16
+	transferIDLen     = 16
 )
 
 // ErrStreamUnsupported is returned by SendFileStream when the peer does not
@@ -392,32 +392,56 @@ type StreamReceiver struct {
 	onSaved     func(name, path string, size int64)
 	nameSuffix  func(base string) string // produces the final unique filename
 
+	// quotaBytes caps total on-disk bytes under receivedDir (completed files
+	// + .partial fragments). Enforced on INIT (declared size) and on every
+	// chunk write so a peer cannot overrun the disk mid-stream. Zero ⇒ no
+	// quota.
+	quotaBytes int64
+
 	mu        sync.Mutex
 	transfers map[[transferIDLen]byte]*recvTransfer
 }
 
 type recvTransfer struct {
-	file     *os.File
-	partial  string
-	name     string
-	size     uint64
-	hash     [32]byte
-	cursor   uint64            // highest contiguous byte written
-	pending  map[uint64][]byte // out-of-order chunks held until contiguous
+	file      *os.File
+	partial   string
+	name      string
+	size      uint64
+	hash      [32]byte
+	cursor    uint64            // highest contiguous byte written
+	pending   map[uint64][]byte // out-of-order chunks held until contiguous
 	pendBytes int
+	// quotaBudget is the number of additional bytes this transfer may still
+	// write to disk before tripping the receiver quota. Snapshotted at INIT
+	// (quota minus everything already on disk other than this .partial) and
+	// debited as contiguous chunks land. -1 ⇒ unlimited (quota disabled).
+	quotaBudget int64
 }
 
 // NewStreamReceiver builds a receiver writing into receivedDir. nameSuffix
 // maps a base filename to a final unique name (nil ⇒ a timestamped default).
-// onSaved (nil ok) fires after a verified file is renamed into place.
+// onSaved (nil ok) fires after a verified file is renamed into place. No disk
+// quota is enforced — use NewStreamReceiverWithQuota to bound on-disk bytes.
 func NewStreamReceiver(receivedDir string, nameSuffix func(base string) string, onSaved func(name, path string, size int64)) *StreamReceiver {
+	return NewStreamReceiverWithQuota(receivedDir, nameSuffix, onSaved, 0)
+}
+
+// NewStreamReceiverWithQuota is NewStreamReceiver with a disk quota:
+// quotaBytes caps the total on-disk bytes under receivedDir (completed files
+// plus retained .partial fragments). Enforced on INIT and on every chunk
+// write so a peer cannot fill the disk mid-stream. Zero ⇒ unlimited.
+func NewStreamReceiverWithQuota(receivedDir string, nameSuffix func(base string) string, onSaved func(name, path string, size int64), quotaBytes int64) *StreamReceiver {
 	if nameSuffix == nil {
 		nameSuffix = defaultStreamName
+	}
+	if quotaBytes < 0 {
+		quotaBytes = 0
 	}
 	return &StreamReceiver{
 		receivedDir: receivedDir,
 		onSaved:     onSaved,
 		nameSuffix:  nameSuffix,
+		quotaBytes:  quotaBytes,
 		transfers:   make(map[[transferIDLen]byte]*recvTransfer),
 	}
 }
@@ -467,6 +491,24 @@ func (sr *StreamReceiver) handleInit(id [transferIDLen]byte, body []byte) *Frame
 	}
 	partial := filepath.Join(partialDir, hex.EncodeToString(id[:]))
 
+	// Quota gate: reject up front if the declared size cannot fit alongside
+	// what is already on disk (excluding this transfer's own .partial, which
+	// resume credits back). Bounds disk use before a single chunk lands.
+	quotaBudget := int64(-1)
+	if sr.quotaBytes > 0 {
+		used := dirSizeExcluding(sr.receivedDir, partial)
+		budget := sr.quotaBytes - used
+		if budget < 0 {
+			budget = 0
+		}
+		if int64(size) > budget {
+			return encodeComplete(id, false,
+				fmt.Sprintf("receiver disk quota exceeded: need %d, %d of %d available",
+					size, budget, sr.quotaBytes))
+		}
+		quotaBudget = budget
+	}
+
 	file, err := os.OpenFile(partial, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
 		return encodeComplete(id, false, "open partial: "+err.Error())
@@ -489,13 +531,14 @@ func (sr *StreamReceiver) handleInit(id [transferIDLen]byte, body []byte) *Frame
 		_ = old.file.Close()
 	}
 	sr.transfers[id] = &recvTransfer{
-		file:    file,
-		partial: partial,
-		name:    sanitizeBase(name),
-		size:    size,
-		hash:    hash,
-		cursor:  resume,
-		pending: make(map[uint64][]byte),
+		file:        file,
+		partial:     partial,
+		name:        sanitizeBase(name),
+		size:        size,
+		hash:        hash,
+		cursor:      resume,
+		pending:     make(map[uint64][]byte),
+		quotaBudget: quotaBudget,
 	}
 	sr.mu.Unlock()
 
@@ -548,8 +591,16 @@ func (sr *StreamReceiver) handleChunk(id [transferIDLen]byte, body []byte) *Fram
 }
 
 // writeAt appends a contiguous chunk at off (== cursor) and advances cursor.
-// Caller holds sr.mu.
+// Caller holds sr.mu. Debits the per-transfer disk-quota budget and refuses
+// the write if it would overrun, so a peer that lies about its declared size
+// (sends more chunk bytes than INIT promised) still cannot exceed the quota.
 func (sr *StreamReceiver) writeAt(t *recvTransfer, off uint64, data []byte) error {
+	if t.quotaBudget >= 0 {
+		if int64(len(data)) > t.quotaBudget {
+			return fmt.Errorf("receiver disk quota exceeded at offset %d", off)
+		}
+		t.quotaBudget -= int64(len(data))
+	}
 	if _, err := t.file.WriteAt(data, int64(off)); err != nil {
 		return fmt.Errorf("write at %d: %w", off, err)
 	}
@@ -626,6 +677,27 @@ func (sr *StreamReceiver) Close() {
 	}
 	sr.transfers = make(map[[transferIDLen]byte]*recvTransfer)
 	sr.mu.Unlock()
+}
+
+// dirSizeExcluding sums the on-disk size of every regular file under dir,
+// recursively, skipping the single file at excludePath (this transfer's own
+// .partial, whose resume bytes are credited back into the budget). A missing
+// directory counts as zero. Best-effort: unreadable entries are skipped.
+func dirSizeExcluding(dir, excludePath string) int64 {
+	var total int64
+	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if path == excludePath {
+			return nil
+		}
+		if info, ierr := d.Info(); ierr == nil {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
 }
 
 func sanitizeBase(name string) string {
