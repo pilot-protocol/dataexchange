@@ -12,17 +12,23 @@ package dataexchange
 
 import (
 	"context"
+	"time"
 
 	"github.com/pilot-protocol/common/coreapi"
 )
 
 // ServiceConfig mirrors the real ServiceConfig so cmd/daemon's
 // dataexchange.NewService(dataexchange.ServiceConfig{...}) call site
-// compiles unchanged when the plugin is disabled.
+// compiles unchanged when the plugin is disabled. Field set kept in sync
+// with the real ServiceConfig in service.go.
 type ServiceConfig struct {
-	ReceivedDir   string
-	InboxDir      string
-	IncludeBase64 bool
+	ReceivedDir      string
+	InboxDir         string
+	IncludeBase64    bool
+	InboxMaxFiles    int
+	InboxMaxBytes    int64
+	ReceivedMaxBytes int64
+	IdleTimeout      time.Duration
 }
 
 // Service is a no-op replacement for the real plugin Service.

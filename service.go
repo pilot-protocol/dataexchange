@@ -16,6 +16,7 @@ import (
 	"sort"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/pilot-protocol/common/coreapi"
 	"github.com/pilot-protocol/common/protocol"
@@ -38,10 +39,79 @@ type ServiceConfig struct {
 	// disk indefinitely.
 	InboxMaxFiles int
 	// InboxMaxBytes caps the total on-disk bytes used by the inbox.
-	// When > 0, saveInboxMessage checks the accumulated size before
-	// every write and evictExpandOverflow uses bytes instead of file
-	// count. Zero ⇒ no byte cap (backward-compatible).
+	// saveInboxMessage checks the accumulated size before every write and
+	// evicts oldest-first when over. Zero ⇒ DefaultInboxMaxBytes; a
+	// negative value disables the byte cap entirely (escape hatch).
 	InboxMaxBytes int64
+	// ReceivedMaxBytes caps the total on-disk bytes used by the received-
+	// files directory (completed TypeFile / TypeFileStream files plus any
+	// retained .partial fragments). Enforced before every write so a peer
+	// cannot fill the disk. Zero ⇒ DefaultReceivedMaxBytes; a negative
+	// value disables the quota entirely (escape hatch).
+	ReceivedMaxBytes int64
+	// IdleTimeout bounds how long a single connection may sit without
+	// delivering the next frame. Reset before every read, so a slowloris
+	// peer that opens a connection and dribbles (or stalls) is dropped
+	// instead of pinning the goroutine and its buffers indefinitely.
+	// Zero ⇒ DefaultIdleTimeout; a negative value disables the deadline.
+	IdleTimeout time.Duration
+}
+
+// Defensible defaults applied when the corresponding ServiceConfig field
+// is left at its zero value. A negative field value disables the limit.
+const (
+	// DefaultInboxMaxBytes caps inbox JSON at 256 MiB total.
+	DefaultInboxMaxBytes int64 = 256 << 20
+	// DefaultReceivedMaxBytes caps received files + partials at 2 GiB total.
+	DefaultReceivedMaxBytes int64 = 2 << 30
+	// DefaultIdleTimeout drops a connection idle for 2 minutes between frames.
+	DefaultIdleTimeout = 2 * time.Minute
+)
+
+// readDeadliner is the optional deadline surface a Stream may expose. The
+// production transport (*driver.Conn) implements it; test pipes generally do
+// not, so we type-assert and skip the deadline when it is unavailable.
+type readDeadliner interface {
+	SetReadDeadline(time.Time) error
+}
+
+// effectiveInboxMaxBytes resolves the configured inbox byte cap: zero ⇒
+// default, negative ⇒ disabled (returns 0).
+func (s *Service) effectiveInboxMaxBytes() int64 {
+	switch {
+	case s.cfg.InboxMaxBytes < 0:
+		return 0
+	case s.cfg.InboxMaxBytes == 0:
+		return DefaultInboxMaxBytes
+	default:
+		return s.cfg.InboxMaxBytes
+	}
+}
+
+// effectiveReceivedMaxBytes resolves the received-files quota: zero ⇒
+// default, negative ⇒ disabled (returns 0).
+func (s *Service) effectiveReceivedMaxBytes() int64 {
+	switch {
+	case s.cfg.ReceivedMaxBytes < 0:
+		return 0
+	case s.cfg.ReceivedMaxBytes == 0:
+		return DefaultReceivedMaxBytes
+	default:
+		return s.cfg.ReceivedMaxBytes
+	}
+}
+
+// effectiveIdleTimeout resolves the per-connection idle deadline: zero ⇒
+// default, negative ⇒ disabled (returns 0).
+func (s *Service) effectiveIdleTimeout() time.Duration {
+	switch {
+	case s.cfg.IdleTimeout < 0:
+		return 0
+	case s.cfg.IdleTimeout == 0:
+		return DefaultIdleTimeout
+	default:
+		return s.cfg.IdleTimeout
+	}
 }
 
 // inboxEvictCheckEvery: only run the eviction-scan once every N saves
@@ -153,7 +223,15 @@ func (s *Service) handleConn(ctx context.Context, conn coreapi.Stream) {
 		}
 	}
 
+	idle := s.effectiveIdleTimeout()
+	dl, canDeadline := conn.(readDeadliner)
 	for {
+		// Reset the idle/read deadline before every frame so a slowloris
+		// peer that opens a connection and then dribbles or stalls is torn
+		// down instead of holding the goroutine and its buffers forever.
+		if canDeadline && idle > 0 {
+			_ = dl.SetReadDeadline(time.Now().Add(idle))
+		}
 		frame, err := ReadFrame(conn)
 		// Capture right after the IO read so receiver-side timestamps are as
 		// close to the wire as possible.
@@ -183,7 +261,7 @@ func (s *Service) handleConn(ctx context.Context, conn coreapi.Stream) {
 					_ = WriteFrame(conn, &Frame{Type: TypeText, Payload: []byte("ERR mkdir: " + mderr.Error())})
 					return
 				}
-				sr = NewStreamReceiver(dir, streamNameSuffix, streamOnSaved)
+				sr = NewStreamReceiverWithQuota(dir, streamNameSuffix, streamOnSaved, s.effectiveReceivedMaxBytes())
 			}
 			if resp := sr.HandleFrame(frame); resp != nil {
 				if werr := WriteFrame(conn, resp); werr != nil {
@@ -281,6 +359,27 @@ func (s *Service) saveReceivedFile(frame *Frame) error {
 		return fmt.Errorf("mkdir: %w", err)
 	}
 
+	// Disk quota: reject the file up front if storing it would push the
+	// received directory (completed files + retained .partial fragments)
+	// past the quota, so a peer cannot fill the disk one file at a time.
+	if quota := s.effectiveReceivedMaxBytes(); quota > 0 {
+		current, _ := dirTotalBytes(dir)
+		if current+int64(len(frame.Payload)) > quota {
+			slog.Warn("received-files quota exceeded",
+				"current_bytes", current, "max_bytes", quota,
+				"frame_bytes", len(frame.Payload))
+			if s.deps.Events != nil {
+				s.deps.Events.Publish("received.full", map[string]any{
+					"type":        TypeName(frame.Type),
+					"frame_bytes": len(frame.Payload),
+					"max_bytes":   quota,
+				})
+			}
+			return fmt.Errorf("received-files quota exceeded: %d + %d > %d",
+				current, len(frame.Payload), quota)
+		}
+	}
+
 	safeName := filepath.Base(frame.Filename)
 	ts := time.Now().Format("20060102-150405.000")
 	seq := s.seq.Add(1)
@@ -312,31 +411,32 @@ func (s *Service) saveInboxMessage(frame *Frame, from protocol.Addr) error {
 		return fmt.Errorf("mkdir: %w", err)
 	}
 
-	// Byte-budget check: if InboxMaxBytes is set, confirm there is room
-	// BEFORE writing. Evict if over, then re-check.
-	if s.cfg.InboxMaxBytes > 0 {
+	// Byte-budget check: confirm there is room BEFORE writing. Evict if
+	// over, then re-check. The cap is always on (defaulted) unless the
+	// operator explicitly disables it with a negative config value.
+	if maxBytes := s.effectiveInboxMaxBytes(); maxBytes > 0 {
 		current, _ := inboxTotalBytes(dir)
 		// Estimate the JSON overhead: type, from, data, bytes, received_at,
 		// and possibly data_b64.
 		estimated := int64(len(frame.Payload)) + 256
-		if current+estimated > s.cfg.InboxMaxBytes {
+		if current+estimated > maxBytes {
 			s.evictInboxOverflowByBytes(dir)
 			after, _ := inboxTotalBytes(dir)
-			if after+estimated > s.cfg.InboxMaxBytes {
+			if after+estimated > maxBytes {
 				slog.Warn("inbox byte budget exceeded after eviction",
 					"current_bytes", after,
-					"max_bytes", s.cfg.InboxMaxBytes,
+					"max_bytes", maxBytes,
 					"frame_bytes", len(frame.Payload))
 				if s.deps.Events != nil {
 					s.deps.Events.Publish("inbox.full", map[string]any{
 						"from":        from.String(),
 						"type":        TypeName(frame.Type),
 						"frame_bytes": len(frame.Payload),
-						"max_bytes":   s.cfg.InboxMaxBytes,
+						"max_bytes":   maxBytes,
 					})
 				}
 				return fmt.Errorf("inbox byte budget exceeded: %d + %d > %d",
-					after, estimated, s.cfg.InboxMaxBytes)
+					after, estimated, maxBytes)
 			}
 		}
 	}
@@ -348,10 +448,19 @@ func (s *Service) saveInboxMessage(frame *Frame, from protocol.Addr) error {
 		"bytes":       len(frame.Payload),
 		"received_at": ts.Format(time.RFC3339Nano),
 	}
-	if s.cfg.IncludeBase64 {
+	// Store the payload losslessly. JSON cannot represent arbitrary bytes in
+	// a string — invalid UTF-8 is replaced with U+FFFD by encoding/json — so
+	// any payload that is not valid UTF-8 (all binary frames, in practice)
+	// is written as base64 instead of being silently corrupted. IncludeBase64
+	// forces base64 for every payload (back-compat for consumers that always
+	// expect data_b64). A `data_encoding` field tells the reader which form
+	// to expect.
+	if s.cfg.IncludeBase64 || frame.Type == TypeBinary || !utf8.Valid(frame.Payload) {
 		msg["data_b64"] = base64.StdEncoding.EncodeToString(frame.Payload)
+		msg["data_encoding"] = "base64"
 	} else {
 		msg["data"] = string(frame.Payload)
+		msg["data_encoding"] = "utf8"
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -491,4 +600,30 @@ func inboxTotalBytes(dir string) (int64, error) {
 		total += info.Size()
 	}
 	return total, nil
+}
+
+// dirTotalBytes sums the on-disk size of every regular file under dir,
+// recursively — so the received-files quota accounts for both completed
+// files and the .partial fragments of in-flight streamed transfers. A
+// missing directory counts as zero (not yet created).
+func dirTotalBytes(dir string) (int64, error) {
+	var total int64
+	err := filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil // skip unreadable entries; best-effort accounting
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, ierr := d.Info()
+		if ierr != nil {
+			return nil
+		}
+		total += info.Size()
+		return nil
+	})
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	return total, err
 }

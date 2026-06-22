@@ -3,6 +3,7 @@
 package dataexchange
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -68,19 +69,27 @@ func ReadTracePayload(f *Frame) (*TraceFrame, error) {
 // maxFilenameLen limits filename length to prevent abuse.
 const maxFilenameLen = 255
 
-// DefaultMaxFrameSize caps a single data-exchange frame at 1 GiB.
+// DefaultMaxFrameSize caps a single data-exchange frame at 64 MiB.
 //
 // The wire format's length field is a uint32 (see Frame docstring below),
-// so the absolute ceiling is ~4 GiB; this cap exists purely to bound the
-// memory the receiver allocates for any single transfer. Raising it
-// trades RAM for the ability to ship larger artefacts in one frame.
+// so the absolute ceiling is ~4 GiB; this cap exists to bound the memory a
+// single hostile peer can make the receiver commit for one transfer. The
+// receiver no longer pre-allocates the attacker-declared length up front
+// (see ReadFrame) — it grows the buffer as bytes actually arrive — but the
+// cap still bounds the steady-state worst case, so it is deliberately set
+// well below the wire ceiling.
 //
-// History: was 256 MiB pre-2026-06-14 (sized for the test fleet's 100 MiB
-// payloads). Raised after operators on multi-GiB-RAM hosts hit the cap on
-// real workloads; the chunked streaming protocol described in
-// docs/PROPOSAL-reliable-file-transfer.md (web4) will eventually remove
-// the need for a per-frame cap entirely.
-const DefaultMaxFrameSize uint32 = 1 << 30
+// 64 MiB comfortably covers inbox messages and the deprecated legacy
+// single-frame TypeFile path; anything larger should ride the chunked
+// TypeFileStream protocol (filestream.go), which never buffers a whole
+// file in memory. Operators who genuinely need bigger single frames can
+// raise the cap via PILOT_DATAEXCHANGE_MAX_FRAME (both ends must agree).
+//
+// History: 256 MiB pre-2026-06-14, then briefly 1 GiB (sized for the test
+// fleet's 100 MiB payloads on multi-GiB-RAM hosts). 1 GiB let a single
+// hostile peer OOM the receiver, so the default was lowered to 64 MiB and
+// the up-front allocation was removed.
+const DefaultMaxFrameSize uint32 = 64 << 20
 
 // MaxFrameSize is the runtime-effective frame cap. Set at package init
 // from the PILOT_DATAEXCHANGE_MAX_FRAME env var (in bytes) if present
@@ -118,8 +127,14 @@ type Frame struct {
 func WriteFrame(w io.Writer, f *Frame) error {
 	payload := f.Payload
 	if f.Type == TypeFile {
-		// Prepend filename
+		// Prepend filename. Validate the length BEFORE the uint16 cast: a
+		// name longer than 65535 bytes would wrap the 2-byte length field
+		// and silently truncate, and any name over maxFilenameLen is
+		// rejected by ReadFrame anyway — fail fast on the writer side.
 		name := []byte(f.Filename)
+		if len(name) > maxFilenameLen {
+			return fmt.Errorf("filename too long: %d bytes (max %d)", len(name), maxFilenameLen)
+		}
 		payload = make([]byte, 2+len(name)+len(f.Payload))
 		binary.BigEndian.PutUint16(payload[0:2], uint16(len(name)))
 		copy(payload[2:], name)
@@ -149,8 +164,14 @@ func ReadFrame(r io.Reader) (*Frame, error) {
 		return nil, fmt.Errorf("frame too large: %d (max %d)", length, MaxFrameSize)
 	}
 
-	payload := make([]byte, length)
-	if _, err := io.ReadFull(r, payload); err != nil {
+	// Do NOT pre-allocate `length` bytes — that is the attacker-declared
+	// size, so a single hostile peer could announce a huge (but in-cap)
+	// frame and never send the bytes, pinning that much RAM per connection.
+	// Instead grow incrementally as bytes actually arrive, with a bounded
+	// starting capacity. io.CopyN stops at exactly `length`, and the final
+	// length is re-checked so a truncated stream surfaces as ErrUnexpectedEOF.
+	payload, err := readBounded(r, int64(length))
+	if err != nil {
 		return nil, err
 	}
 
@@ -181,6 +202,40 @@ func ReadFrame(r io.Reader) (*Frame, error) {
 	}
 
 	return f, nil
+}
+
+// readBoundedInitialCap bounds the initial buffer capacity reserved before
+// any payload bytes arrive. A frame can legitimately be up to MaxFrameSize,
+// but reserving that much for the declared (untrusted) length is exactly the
+// OOM vector we are closing — so we reserve at most this much up front and
+// let bytes.Buffer grow geometrically as real data lands.
+const readBoundedInitialCap = 64 * 1024
+
+// readBounded reads exactly n bytes from r without trusting n to size the
+// initial allocation. It grows a buffer as bytes arrive (capped initial
+// reservation), so an attacker who declares a large length but never sends
+// the bytes only ties up the small initial buffer, not n bytes. A short
+// read returns io.ErrUnexpectedEOF, matching io.ReadFull's contract.
+func readBounded(r io.Reader, n int64) ([]byte, error) {
+	if n == 0 {
+		return []byte{}, nil
+	}
+	initial := n
+	if initial > readBoundedInitialCap {
+		initial = readBoundedInitialCap
+	}
+	buf := bytes.NewBuffer(make([]byte, 0, initial))
+	read, err := io.CopyN(buf, r, n)
+	if err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+		return nil, err
+	}
+	if read != n {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return buf.Bytes(), nil
 }
 
 // TypeName returns a human-readable name for a frame type.
