@@ -30,7 +30,7 @@ jobs:
           repository: pilot-protocol/common
           path: common
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: dataexchange/go.mod
           cache: true
