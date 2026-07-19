@@ -212,9 +212,8 @@ func TestService_Stop_CtxCancelled(t *testing.T) {
 // (`len(files) <= cap`) correctly short-circuits so no real file is wrongly
 // evicted just because a subdirectory inflated the entry count.
 //
-// REMOVE THIS COMMENT WHEN PILOT-183 LANDS: the fix will move the
-// IsDir() filter ABOVE the first early-return so both checks operate on
-// the same population.
+// PILOT-183 FIX LANDED: the IsDir() filter now runs before the
+// early-return check, so both guards operate on file-only entries.
 func TestEvictInboxOverflow_PILOT183_SubdirMixedWithFiles(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
