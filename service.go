@@ -509,9 +509,7 @@ func (s *Service) evictInboxOverflow(dir string) {
 		slog.Debug("inbox evict: readdir", "dir", dir, "err", err)
 		return
 	}
-	if len(entries) <= maxFiles {
-		return
-	}
+	// Filter out subdirectories — they consume no inbox capacity.
 	type aged struct {
 		name string
 		mod  time.Time
