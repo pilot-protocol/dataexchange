@@ -4,7 +4,8 @@ package dataexchange
 
 import (
 	"crypto/sha256"
-	"os"
+	"io/fs"
+	"path/filepath"
 	"testing"
 )
 
@@ -49,19 +50,25 @@ func TestStreamChunkBeyondDeclaredSizeIsRefused(t *testing.T) {
 		t.Fatalf("overrunning tail chunk was accepted (%q)", msg)
 	}
 
-	// Nothing past the declared size reached the disk.
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("readdir: %v", err)
-	}
-	for _, e := range entries {
-		info, err := e.Info()
+	// Nothing past the declared size reached the disk. The receiver keeps
+	// its .partial fragments in a subdirectory, so walk the tree and look
+	// at regular files only — a directory's own reported size varies by
+	// filesystem and says nothing about the transfer.
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		info, err := d.Info()
 		if err != nil {
-			continue
+			return nil
 		}
 		if info.Size() > declared {
-			t.Fatalf("%s is %d bytes, declared size was %d", e.Name(), info.Size(), declared)
+			t.Fatalf("%s is %d bytes, declared size was %d", path, info.Size(), declared)
 		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", dir, err)
 	}
 }
 
