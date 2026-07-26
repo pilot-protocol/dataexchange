@@ -556,6 +556,15 @@ func (sr *StreamReceiver) handleChunk(id [transferIDLen]byte, body []byte) *Fram
 		sr.mu.Unlock()
 		return encodeStreamFrame(streamKindAbort, id, []byte("no active transfer (send INIT first)"))
 	}
+	// A chunk has to fit inside the size declared at INIT. Checking here
+	// rather than at DONE keeps the .partial file bounded by the size the
+	// receiver agreed to, whether the chunk is written now or buffered
+	// for later.
+	if off > t.size || uint64(len(data)) > t.size-off {
+		sr.mu.Unlock()
+		return encodeComplete(id, false,
+			fmt.Sprintf("chunk at %d of %d bytes exceeds declared size %d", off, len(data), t.size))
+	}
 	switch {
 	case off == t.cursor:
 		if werr := sr.writeAt(t, off, data); werr != nil {
