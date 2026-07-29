@@ -456,6 +456,21 @@ func defaultStreamName(base string) string {
 // maxPendingBytes bounds the out-of-order buffer per transfer.
 const maxPendingBytes = streamWindow * StreamChunkSize
 
+// maxConcurrentTransfers caps how many in-flight receives one StreamReceiver
+// (i.e. one peer connection) may hold open at once.
+//
+// handleInit opens a real *os.File per transfer and stores it under a
+// PEER-CHOSEN 16-byte transfer ID. Without a cap, a peer could issue INIT
+// repeatedly with fresh IDs and hold one file descriptor plus one .partial
+// file each, exhausting the process FD limit in seconds. The existing
+// quotaBytes gate bounds BYTES on disk but says nothing about descriptor
+// count or map cardinality — and NewStreamReceiver defaults quota to 0,
+// meaning unlimited.
+//
+// 64 is far above any legitimate use (bundles transfer a handful of files
+// at a time) while keeping worst-case FD use per connection trivial.
+const maxConcurrentTransfers = 64
+
 // HandleFrame processes one TypeFileStream frame and returns the response
 // frame to send back (nil ⇒ nothing to send). It never returns an error for
 // protocol-level problems — those are reported to the peer via COMPLETE /
@@ -527,8 +542,17 @@ func (sr *StreamReceiver) handleInit(id [transferIDLen]byte, body []byte) *Frame
 
 	sr.mu.Lock()
 	// Replace any stale in-memory transfer for this id (e.g. a prior conn).
-	if old := sr.transfers[id]; old != nil && old.file != nil {
-		_ = old.file.Close()
+	if old := sr.transfers[id]; old != nil {
+		if old.file != nil {
+			_ = old.file.Close()
+		}
+	} else if len(sr.transfers) >= maxConcurrentTransfers {
+		// New id and already at capacity: refuse rather than opening
+		// another descriptor. Release the file we just opened, or this
+		// rejection would leak the very FD it exists to protect.
+		sr.mu.Unlock()
+		_ = file.Close()
+		return encodeComplete(id, false, "too many concurrent transfers")
 	}
 	sr.transfers[id] = &recvTransfer{
 		file:        file,
@@ -650,6 +674,14 @@ func (sr *StreamReceiver) handleDone(id [transferIDLen]byte) *Frame {
 	finalName := sr.nameSuffix(t.name)
 	finalPath := filepath.Join(sr.receivedDir, finalName)
 	if err := os.Rename(t.partial, finalPath); err != nil {
+		// Drop the in-memory transfer. t.file was already closed above, so
+		// leaving the entry in place stranded a record holding a closed
+		// handle — and a retried DONE for the same id would then read from
+		// that closed file. The sha-mismatch branch above already calls
+		// discard; this branch was the one that returned without any
+		// cleanup. The .partial is deliberately left on disk for
+		// inspection/resume, exactly as in the mismatch case.
+		sr.forget(id)
 		return encodeComplete(id, false, "rename: "+err.Error())
 	}
 	sr.forget(id)
