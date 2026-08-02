@@ -74,6 +74,19 @@ const (
 // fresh connection.
 var ErrStreamUnsupported = errors.New("dataexchange: peer does not support TypeFileStream")
 
+// BuildStreamInitPayload returns the deterministic INIT payload that a caller
+// must bind in a signed file.share Intent before SendGovernedFileStream. The
+// transfer ID is derived from the supplied full SHA-256, matching the sender's
+// resumable-transfer state machine.
+func BuildStreamInitPayload(name string, size int64, fullHash [32]byte) ([]byte, error) {
+	if size < 0 || !validGovernedFilename(name) {
+		return nil, fmt.Errorf("dataexchange: governed stream requires a non-negative size and safe filename")
+	}
+	var id [transferIDLen]byte
+	copy(id[:], fullHash[:transferIDLen])
+	return append([]byte(nil), encodeInit(id, uint64(size), fullHash, uint32(StreamChunkSize), name).Payload...), nil
+}
+
 // --- control-frame codec ---------------------------------------------------
 
 func encodeStreamFrame(kind byte, id [transferIDLen]byte, body []byte) *Frame {
@@ -116,7 +129,7 @@ func decodeInit(body []byte) (size uint64, hash [32]byte, chunkSize uint32, name
 	copy(hash[:], body[8:40])
 	chunkSize = binary.BigEndian.Uint32(body[40:44])
 	nameLen := int(binary.BigEndian.Uint16(body[44:46]))
-	if 46+nameLen > len(body) {
+	if 46+nameLen != len(body) {
 		return 0, hash, 0, "", false
 	}
 	name = string(body[46 : 46+nameLen])
@@ -200,6 +213,22 @@ func (c *Client) SendFileStream(name string, r io.ReadSeeker, size int64, stepTi
 }
 
 func streamSend(conn frameRW, name string, r io.ReadSeeker, size int64, stepTimeout time.Duration) (*StreamResult, error) {
+	return streamSendWithInit(conn, name, r, size, stepTimeout, func(id [transferIDLen]byte, declaredSize uint64, hash [32]byte, chunkSize uint32, filename string) (*Frame, error) {
+		return encodeInit(id, declaredSize, hash, chunkSize, filename), nil
+	})
+}
+
+// streamInitBuilder allows the sender to substitute a governed INIT envelope
+// while keeping the exact same chunk/ACK/resume state machine.
+type streamInitBuilder func([transferIDLen]byte, uint64, [32]byte, uint32, string) (*Frame, error)
+
+func streamSendWithInit(conn frameRW, name string, r io.ReadSeeker, size int64, stepTimeout time.Duration, buildInit streamInitBuilder) (*StreamResult, error) {
+	if buildInit == nil {
+		return nil, fmt.Errorf("dataexchange: stream INIT builder is required")
+	}
+	if size < 0 {
+		return nil, fmt.Errorf("dataexchange: stream size must not be negative")
+	}
 	if stepTimeout <= 0 {
 		stepTimeout = streamStepTimeout
 	}
@@ -219,7 +248,11 @@ func streamSend(conn frameRW, name string, r io.ReadSeeker, size int64, stepTime
 	}
 
 	// INIT + negotiate.
-	if err := WriteFrame(conn, encodeInit(id, uint64(size), fullHash, uint32(StreamChunkSize), name)); err != nil {
+	init, err := buildInit(id, uint64(size), fullHash, uint32(StreamChunkSize), name)
+	if err != nil {
+		return nil, fmt.Errorf("build INIT: %w", err)
+	}
+	if err := WriteFrame(conn, init); err != nil {
 		return nil, fmt.Errorf("send INIT: %w", err)
 	}
 	initAck, err := recvFrameTimeout(conn, streamNegTimeout)
@@ -390,7 +423,16 @@ func recvFrameTimeout(conn frameRW, d time.Duration) (*Frame, error) {
 type StreamReceiver struct {
 	receivedDir string
 	onSaved     func(name, path string, size int64)
-	nameSuffix  func(base string) string // produces the final unique filename
+	// onPrepare runs after full-content integrity verification but before the
+	// atomic rename. It lets a governed service durably record retention work
+	// for the final path before that path can become visible after a crash.
+	onPrepare func([transferIDLen]byte, string, string, int64) error
+	// onCommit runs after integrity verification and atomic rename, but before
+	// onSaved. A required receipt recorder uses it to make the visible file
+	// contingent on durable enforcement evidence; a callback error removes the
+	// just-renamed file and turns COMPLETE into a failure.
+	onCommit   func([transferIDLen]byte, string, string, int64) error
+	nameSuffix func(base string) string // produces the final unique filename
 
 	// quotaBytes caps total on-disk bytes under receivedDir (completed files
 	// + .partial fragments). Enforced on INIT (declared size) and on every
@@ -423,7 +465,7 @@ type recvTransfer struct {
 // onSaved (nil ok) fires after a verified file is renamed into place. No disk
 // quota is enforced — use NewStreamReceiverWithQuota to bound on-disk bytes.
 func NewStreamReceiver(receivedDir string, nameSuffix func(base string) string, onSaved func(name, path string, size int64)) *StreamReceiver {
-	return NewStreamReceiverWithQuota(receivedDir, nameSuffix, onSaved, 0)
+	return NewStreamReceiverWithQuotaAndCommit(receivedDir, nameSuffix, onSaved, nil, 0)
 }
 
 // NewStreamReceiverWithQuota is NewStreamReceiver with a disk quota:
@@ -431,6 +473,21 @@ func NewStreamReceiver(receivedDir string, nameSuffix func(base string) string, 
 // plus retained .partial fragments). Enforced on INIT and on every chunk
 // write so a peer cannot fill the disk mid-stream. Zero ⇒ unlimited.
 func NewStreamReceiverWithQuota(receivedDir string, nameSuffix func(base string) string, onSaved func(name, path string, size int64), quotaBytes int64) *StreamReceiver {
+	return NewStreamReceiverWithQuotaAndCommit(receivedDir, nameSuffix, onSaved, nil, quotaBytes)
+}
+
+// NewStreamReceiverWithQuotaAndCommit extends the normal receiver with a
+// transactional commit hook. It is intended for governed streams: the hook
+// records evidence after the final file is durable but before consumers are
+// notified. A hook failure removes the final file and reports COMPLETE failure.
+func NewStreamReceiverWithQuotaAndCommit(receivedDir string, nameSuffix func(base string) string, onSaved func(name, path string, size int64), onCommit func([transferIDLen]byte, string, string, int64) error, quotaBytes int64) *StreamReceiver {
+	return NewStreamReceiverWithQuotaAndPrepareAndCommit(receivedDir, nameSuffix, onSaved, nil, onCommit, quotaBytes)
+}
+
+// NewStreamReceiverWithQuotaAndPrepareAndCommit adds a pre-rename durable
+// preparation hook to the governed commit path. A preparation error leaves no
+// final file visible; callers may keep the partial for retry/inspection.
+func NewStreamReceiverWithQuotaAndPrepareAndCommit(receivedDir string, nameSuffix func(base string) string, onSaved func(name, path string, size int64), onPrepare, onCommit func([transferIDLen]byte, string, string, int64) error, quotaBytes int64) *StreamReceiver {
 	if nameSuffix == nil {
 		nameSuffix = defaultStreamName
 	}
@@ -440,6 +497,8 @@ func NewStreamReceiverWithQuota(receivedDir string, nameSuffix func(base string)
 	return &StreamReceiver{
 		receivedDir: receivedDir,
 		onSaved:     onSaved,
+		onPrepare:   onPrepare,
+		onCommit:    onCommit,
 		nameSuffix:  nameSuffix,
 		quotaBytes:  quotaBytes,
 		transfers:   make(map[[transferIDLen]byte]*recvTransfer),
@@ -673,6 +732,12 @@ func (sr *StreamReceiver) handleDone(id [transferIDLen]byte) *Frame {
 	_ = t.file.Close()
 	finalName := sr.nameSuffix(t.name)
 	finalPath := filepath.Join(sr.receivedDir, finalName)
+	if sr.onPrepare != nil {
+		if err := sr.onPrepare(id, finalName, finalPath, int64(t.size)); err != nil {
+			sr.forget(id)
+			return encodeComplete(id, false, "prepare: "+err.Error())
+		}
+	}
 	if err := os.Rename(t.partial, finalPath); err != nil {
 		// Drop the in-memory transfer. t.file was already closed above, so
 		// leaving the entry in place stranded a record holding a closed
@@ -683,6 +748,15 @@ func (sr *StreamReceiver) handleDone(id [transferIDLen]byte) *Frame {
 		// inspection/resume, exactly as in the mismatch case.
 		sr.forget(id)
 		return encodeComplete(id, false, "rename: "+err.Error())
+	}
+	if sr.onCommit != nil {
+		if err := sr.onCommit(id, finalName, finalPath, int64(t.size)); err != nil {
+			if removeErr := os.Remove(finalPath); removeErr != nil && !os.IsNotExist(removeErr) {
+				err = fmt.Errorf("%w; remove uncommitted file: %v", err, removeErr)
+			}
+			sr.forget(id)
+			return encodeComplete(id, false, "commit: "+err.Error())
+		}
 	}
 	sr.forget(id)
 	if sr.onSaved != nil {

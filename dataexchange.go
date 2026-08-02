@@ -33,6 +33,14 @@ const (
 	// peer that does not understand TypeFileStream never sends INIT-ACK, so
 	// the sender falls back to TypeFile.
 	TypeFileStream uint32 = 7
+	// TypeGoverned carries a regular data frame together with the sender's
+	// signed intent and authority decision. It is opt-in; enterprise receivers
+	// can require this envelope before persisting a message or file.
+	TypeGoverned uint32 = 8
+	// TypeGovernedFileStream carries the signed authorization evidence for a
+	// TypeFileStream INIT. Subsequent chunks are accepted only while bound to
+	// that verified transfer ID on the same connection.
+	TypeGovernedFileStream uint32 = 9
 )
 
 // TraceFrame carries timing metadata around an inner message frame.
@@ -253,6 +261,10 @@ func TypeName(t uint32) string {
 		return "TRACE"
 	case TypeFileStream:
 		return "FILESTREAM"
+	case TypeGoverned:
+		return "GOVERNED"
+	case TypeGovernedFileStream:
+		return "GOVERNED_FILESTREAM"
 	default:
 		return fmt.Sprintf("UNKNOWN(%d)", t)
 	}

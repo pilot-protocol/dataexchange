@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/pilot-protocol/common/coreapi"
+	"github.com/pilot-protocol/common/decision"
 )
 
 // ServiceConfig mirrors the real ServiceConfig so cmd/daemon's
@@ -22,13 +23,24 @@ import (
 // compiles unchanged when the plugin is disabled. Field set kept in sync
 // with the real ServiceConfig in service.go.
 type ServiceConfig struct {
-	ReceivedDir      string
-	InboxDir         string
-	IncludeBase64    bool
-	InboxMaxFiles    int
-	InboxMaxBytes    int64
-	ReceivedMaxBytes int64
-	IdleTimeout      time.Duration
+	ReceivedDir                      string
+	InboxDir                         string
+	IncludeBase64                    bool
+	InboxMaxFiles                    int
+	InboxMaxBytes                    int64
+	ReceivedMaxBytes                 int64
+	IdleTimeout                      time.Duration
+	RequireGoverned                  bool
+	GovernedVerifier                 GovernedFrameVerifier
+	GovernedStreamVerifier           GovernedStreamVerifier
+	RequireGovernedReceipts          bool
+	GovernedReceiptRecorder          GovernedReceiptRecorder
+	GovernedContentInspector         decision.DisclosureContentInspector
+	RequireGovernedContentInspection bool
+	GovernedTransferQuota            *decision.TransferQuotaLimiter
+	GovernedRetentionPolicies        []GovernedRetentionPolicy
+	RetentionStateDir                string
+	RetentionSweepInterval           time.Duration
 }
 
 // Service is a no-op replacement for the real plugin Service.

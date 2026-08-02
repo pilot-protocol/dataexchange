@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+//go:build !no_dataexchange
+// +build !no_dataexchange
+
 package dataexchange
 
 import (
