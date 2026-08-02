@@ -157,6 +157,7 @@ type Service struct {
 	done      chan struct{}
 	seq       atomic.Uint64
 	retention *governedRetentionManager
+	replay    *governedReplayGuard
 }
 
 // persistedDelivery separates a disk write from its visible notification so a
@@ -169,7 +170,7 @@ type persistedDelivery struct {
 }
 
 func NewService(cfg ServiceConfig) *Service {
-	return &Service{cfg: cfg}
+	return &Service{cfg: cfg, replay: newGovernedReplayGuard()}
 }
 
 func (s *Service) Name() string { return "dataexchange" }
@@ -606,6 +607,12 @@ func (s *Service) handleConn(ctx context.Context, conn coreapi.Stream) {
 }
 
 func (s *Service) admitGovernedTransfer(intent decision.Intent, bytes uint64) error {
+	if s.replay != nil {
+		if err := s.replay.admit(intent); err != nil {
+			slog.Warn("governed transfer replay rejected", "agent_id", intent.AgentID, "intent_id", intent.ID, "error", err)
+			return err
+		}
+	}
 	if s.cfg.GovernedTransferQuota == nil {
 		return nil
 	}
