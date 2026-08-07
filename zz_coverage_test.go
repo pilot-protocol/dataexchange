@@ -417,8 +417,9 @@ func TestHandleConn_SaveError(t *testing.T) {
 	}
 }
 
-// TestHandleConn_UnknownType — a frame whose type doesn't match any
-// switch arm still produces an ACK (no save, but a default ACK is sent).
+// TestHandleConn_UnknownType ensures an unsupported wire type is rejected.
+// Silently ACKing it would allow a sender to mistake an unverified governed
+// envelope (or a future control frame) for a successfully delivered message.
 func TestHandleConn_UnknownType(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
@@ -432,7 +433,7 @@ func TestHandleConn_UnknownType(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read ack: %v", err)
 	}
-	if !bytes.Contains(ack.Payload, []byte("ACK UNKNOWN(999)")) {
+	if !bytes.Contains(ack.Payload, []byte("ERR UNKNOWN(999) save failed: unsupported frame type 999")) {
 		t.Errorf("ack payload = %q", ack.Payload)
 	}
 }
