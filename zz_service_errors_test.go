@@ -426,7 +426,8 @@ func (e *capturingEvents) Subscribe(pattern string) (<-chan coreapi.Event, func(
 // ---- PILOT-276: inbox byte-budget cap ----------------------------------
 
 // TestSaveInboxMessage_ByteBudgetEnforced verifies that when InboxMaxBytes is
-// set, saveInboxMessage rejects writes that would exceed the budget.
+// set, saveInboxMessage keeps the inbox within the budget by evicting the
+// oldest messages, and rejects only a message that cannot fit at all.
 func TestSaveInboxMessage_ByteBudgetEnforced(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
@@ -438,22 +439,29 @@ func TestSaveInboxMessage_ByteBudgetEnforced(t *testing.T) {
 		t.Fatalf("first save under budget must succeed: %v", err)
 	}
 
-	// Second message — the inbox JSON overhead + data should push over 512.
-	// Force the test by writing a payload that fills the rest of the budget.
-	// After the first save, let's check how many files exist.
-	entries, _ := os.ReadDir(tmp)
-	t.Logf("entries after first save: %d", len(entries))
-
-	// Save enough messages to exceed 512 bytes total.
+	// Save enough messages to exceed 512 bytes several times over: all are
+	// accepted and the total never exceeds the budget.
 	for i := 0; i < 20; i++ {
 		frame := &Frame{Type: TypeText, Payload: []byte(strings.Repeat("x", 50))}
-		err := s.saveInboxMessage(frame, protocol.Addr{Node: 2})
-		if err != nil {
-			t.Logf("saveInboxMessage #%d failed as expected: %v", i+2, err)
-			return // success — budget enforced
+		if err := s.saveInboxMessage(frame, protocol.Addr{Node: 2}); err != nil {
+			t.Fatalf("save #%d: %v", i+2, err)
+		}
+		if total, _ := inboxTotalBytes(tmp); total > 512 {
+			t.Fatalf("save #%d: inbox holds %d bytes, over the 512-byte budget", i+2, total)
 		}
 	}
-	t.Error("expected saveInboxMessage to eventually reject when over byte budget")
+
+	// A message larger than the whole budget is rejected, and nothing is
+	// evicted on its behalf.
+	before, _ := os.ReadDir(tmp)
+	big := &Frame{Type: TypeText, Payload: []byte(strings.Repeat("z", 600))}
+	if err := s.saveInboxMessage(big, protocol.Addr{Node: 2}); err == nil {
+		t.Fatal("a message larger than the byte budget must be rejected")
+	}
+	after, _ := os.ReadDir(tmp)
+	if len(after) != len(before) {
+		t.Fatalf("rejecting an oversized message changed the inbox: %d files before, %d after", len(before), len(after))
+	}
 }
 
 // TestSaveInboxMessage_NoByteBudget_Unbounded documents that with

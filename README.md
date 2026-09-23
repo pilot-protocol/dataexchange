@@ -30,11 +30,14 @@ rt.Register(dataexchange.NewService(dataexchange.ServiceConfig{}))
 
 | File | What it does |
 |---|---|
-| `dataexchange.go` | Wire format: `Frame`, `WriteFrame`, `ReadFrame`, `TraceFrame`, `TypeText/Binary/JSON/File/Trace/Governed`, `TypeName`. |
-| `client.go` | `Client` — `Dial` and send helpers. |
+| `dataexchange.go` | Wire format: `Frame`, `WriteFrame`, `ReadFrame`, `TraceFrame`, `TypeText/Binary/JSON/File/Trace/Governed/Tagged`, `TypeName`. |
+| `tagged.go` | Optional request/reply correlation on the wire: `Frame.MessageID` / `Frame.ReplyTo` (`TypeTagged`), `NewMessageID`, `ValidMessageID`. |
+| `client.go` | `Client` — `Dial`, `Send` (waits for the ACK, falls back for older receivers) and send helpers. |
 | `governed.go` | Signed decision envelope, receiver-side verifier, and enforceable transport constraints. |
 | `server.go` | `Server` — accept loop and handler dispatch. |
 | `service.go` | `*Service` — `coreapi.Service` adapter. Build tag `!no_dataexchange`. |
+| `inbox_budget.go` | Inbox caps: running byte total, oldest-first eviction to 90% of the byte cap, file-count cap. |
+| `dedupe.go` | Receiver-side suppression of identical re-deliveries. |
 | `service_disabled.go` | Stub `*Service` for `-tags no_dataexchange` builds. |
 
 ## Wire format
@@ -45,9 +48,126 @@ rt.Register(dataexchange.NewService(dataexchange.ServiceConfig{}))
 
 For `TypeFile` the payload is prefixed with `[2-byte name length][name bytes]`.
 For `TypeTrace` the payload is `[4-byte inner_type][8-byte sent_at_ns][inner payload]`.
+For `TypeTagged` (10) the payload is
+`[2-byte header_len][header: JSON object][4-byte inner_type][inner payload]`;
+see [Request/reply correlation](#requestreply-correlation-for-service-authors).
 
 Max frame size: 64 MiB by default (configurable at process start with
-`PILOT_DATAEXCHANGE_MAX_FRAME` within its documented safe range).
+`PILOT_DATAEXCHANGE_MAX_FRAME` within its documented safe range). The limit
+applies to the whole payload after the 8-byte header, so for `TypeTagged` it
+includes the correlation header (see below).
+
+## Inbox
+
+Text, JSON and binary messages are written to `~/.pilot/inbox/` as one JSON
+file each:
+
+```json
+{"type":"TEXT","from":"0:0000.0002.BBE4","bytes":5,"received_at":"2026-09-24T10:00:00.123456789Z",
+ "data":"hello","data_encoding":"utf8","message_id":"4f1c…","reply_to":"9b2e…"}
+```
+
+`message_id` and `reply_to` appear only when the sender supplied them (see
+below). Binary or non-UTF-8 payloads are stored as `data_b64` with
+`"data_encoding":"base64"`.
+
+Two caps bound the inbox, and both evict the **oldest** messages first:
+
+- `ServiceConfig.InboxMaxFiles` (default 10000), checked every 64 messages.
+- `ServiceConfig.InboxMaxBytes` (default 256 MiB), checked before every write
+  against a running byte total (no directory scan per message). When a new
+  message would not fit, the oldest messages are removed until the inbox plus
+  the new message is at or below 90% of the cap, so recent replies survive
+  and the next messages do not each trigger another eviction. A message
+  that another connection is still writing is never evicted. A single
+  message larger than the cap is rejected without evicting anything. A
+  negative value disables the byte cap.
+
+## Request/reply correlation (for service authors)
+
+A data-exchange message is fire-and-forget: the sender gets an ACK that the
+peer stored it, and any answer arrives later as a separate message in the
+sender's inbox. To let a requester tell *which* request an answer belongs to,
+a frame can carry two optional fields:
+
+| Field (Go) | Inbox / event key | Meaning |
+|---|---|---|
+| `Frame.MessageID` | `message_id` | An ID the sender chose for this message. Use a fresh random value per message (`NewMessageID()`, 32 hex chars). |
+| `Frame.ReplyTo` | `reply_to` | The `message_id` of the message this one answers. |
+
+IDs are 1–128 characters of `A-Z a-z 0-9 - _ . :`. They are correlation
+metadata only: they are not authenticated (a governed frame's signature does
+not cover them), so never use them for authorization.
+
+**If you run a service** (an agent that answers requests): when a request's
+inbox record (or `message.received` event) has a `message_id`, send your
+answer with `ReplyTo` set to that value. If you answer in several messages,
+set it on each. Give each answer its own `MessageID` too if you want the
+requester's daemon to drop duplicate copies of it (for example when you
+retry a send or it arrives over two network paths). Requests without a
+`message_id` come from older clients: answer them as before.
+
+```go
+c, err := dataexchange.Dial(drv, requester)
+if err != nil { return err }
+defer c.Close()
+res, err := c.Send(&dataexchange.Frame{
+    Type:      dataexchange.TypeJSON,
+    Payload:   answer,
+    MessageID: dataexchange.NewMessageID(),
+    ReplyTo:   request.MessageID, // the request's "message_id"
+})
+```
+
+**If you send requests**: generate a `MessageID`, send with `Client.Send`,
+then wait for an inbox record from that peer whose `reply_to` equals it.
+Services that predate this field answer without `reply_to`; for those, fall
+back to matching on the sender alone.
+
+**Compatibility.** Frames without either field use the original wire format,
+byte for byte. A frame with either field travels as `TypeTagged`. A receiver
+that predates it stores nothing and answers in one of two ways:
+
+- dataexchange v0.2.1 and older (every stable pilot daemon through v1.13.9)
+  has no case for an unknown frame type. It drops the frame and still
+  answers `ACK UNKNOWN(10) <n> bytes`.
+- dataexchange v0.2.2 and later answers `ERR UNKNOWN(10) save failed: ...`.
+
+`Client.Send` recognises both answers, re-sends the same frame without the
+fields on the same connection, and reports `SendResult.Tagged == false`, so a
+new sender can always talk to an old receiver and the message is stored
+exactly once. A raw `WriteFrame` of a tagged frame does not fall back:
+against a v0.2.1-or-older receiver the message is silently lost, so use
+`Client.Send`.
+
+**Size.** The tagged header adds up to `MaxTaggedOverhead` (293) bytes, and
+the whole tagged frame must fit in the max frame size. A payload within 293
+bytes of the limit may fit only untagged. `Client.Send` then sends it
+untagged (`SendResult.Tagged == false`), and a raw `WriteFrame` returns
+`ErrTaggedFrameTooLarge` without writing anything.
+
+Whenever `Tagged` is false, the reply cannot carry `reply_to`; match it on
+the sender alone. The fields can accompany text, JSON, binary, file,
+governed and trace frames. On `TypeFileStream` frames they are ignored.
+
+Wire layout of a tagged frame, for other languages:
+
+```
+[4-byte type = 10][4-byte length][payload]
+payload = [2-byte header_len, 1..1024][header_len bytes: JSON object]
+          [4-byte inner_type][inner payload, exactly as the inner type sends it]
+header  = {"message_id":"…","reply_to":"…"}   (both optional; unknown keys are ignored)
+length  = 2 + header_len + 4 + len(inner payload), at most the max frame size
+```
+
+**Duplicate deliveries.** The receiver remembers every stored frame that
+carried a `MessageID` for `ServiceConfig.DedupeWindow` (default 10 minutes).
+An identical re-delivery — same sender, `MessageID`, `ReplyTo`, type,
+filename and bytes — is acknowledged with the original ACK plus
+` (duplicate)` (`SendResult.Duplicate`) and is not stored again. Frames
+without a `MessageID` are always stored, as before, unless the operator sets
+`ServiceConfig.DedupeContentWindow` (off by default) to also drop
+byte-identical copies from the same sender inside a short window.
 
 ## Governed delivery
 

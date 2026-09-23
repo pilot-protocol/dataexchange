@@ -193,34 +193,27 @@ func TestSaveInboxMessage_BinaryLossless(t *testing.T) {
 func TestSaveInboxMessage_ByteCapEnforced(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
-	// Small cap so a couple of writes blow past it. Each message is the
-	// payload + ~256 estimated JSON overhead, so cap at ~1 KiB.
+	// Small cap so a couple of writes blow past it: each message is the
+	// 400-byte payload plus its JSON envelope, so the cap holds ~2 of them.
 	s := NewService(ServiceConfig{InboxDir: tmp, InboxMaxBytes: 1024})
 
 	from := protocol.Addr{Node: 1}
 	payload := bytes.Repeat([]byte("x"), 400) // valid UTF-8
 
-	// First write fits.
-	if err := s.saveInboxMessage(&Frame{Type: TypeText, Payload: payload}, from); err != nil {
-		t.Fatalf("first write should fit: %v", err)
-	}
-	// Keep writing; the cap must eventually reject (after eviction can no
-	// longer make room, which here happens because every file is ~same size
-	// and the cap holds only ~1-2 of them).
-	rejected := false
+	// Keep writing well past the cap. The oldest messages must be evicted to
+	// make room (FIFO), so every write succeeds and the cap always holds.
 	for i := 0; i < 20; i++ {
 		if err := s.saveInboxMessage(&Frame{Type: TypeText, Payload: payload}, from); err != nil {
-			rejected = true
-			break
+			t.Fatalf("write %d: the byte cap should evict old messages, not reject new ones: %v", i, err)
+		}
+		total, _ := inboxTotalBytes(tmp)
+		if total > 1024 {
+			t.Fatalf("after write %d the inbox holds %d bytes, over the 1024-byte cap", i, total)
 		}
 	}
-	if !rejected {
-		t.Fatal("expected the inbox byte cap to reject a write once full")
-	}
-	// On-disk total must never have exceeded the cap by more than one message.
-	total, _ := inboxTotalBytes(tmp)
-	if total > 1024+int64(len(payload))+512 {
-		t.Fatalf("inbox grew to %d bytes, well past the 1024 cap", total)
+	entries, _ := os.ReadDir(tmp)
+	if len(entries) == 0 {
+		t.Fatal("the byte cap evicted everything; it must keep the newest messages")
 	}
 }
 

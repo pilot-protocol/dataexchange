@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The inbox byte cap no longer deletes the whole inbox. With the default
+  config (`InboxMaxBytes == 0`, meaning 256 MiB) the evictor compared the
+  inbox size against the raw value 0, so the first time the inbox passed
+  256 MiB every stored message was removed, including replies a waiting
+  `pilotctl send-message --wait` was about to read. Both eviction paths now
+  use the effective cap, evict oldest-first down to 90% of it, and never
+  evict for a message that cannot fit at all.
+- The byte cap is checked against a running total instead of listing and
+  stat'ing the whole inbox on every incoming message. A message that another
+  connection is still writing (admitted, but not yet acknowledged) is never
+  evicted and never counted twice.
+- When the byte cap is full the inbox now evicts the oldest messages to make
+  room (as `InboxMaxBytes` was documented to do) instead of rejecting the
+  new message.
+
+### Added
+
+- Optional request/reply correlation: `Frame.MessageID` and `Frame.ReplyTo`,
+  carried on the wire in a new `TypeTagged` (10) wrapper and recorded in
+  inbox JSON and `message.received` / `file.received` events as
+  `message_id` / `reply_to`. Frames without them are byte-for-byte
+  unchanged. `NewMessageID` and `ValidMessageID` helpers.
+- `Client.Send`, which waits for the ACK and delivers a tagged frame
+  untagged, with `SendResult.Tagged == false`, when the tagged form cannot
+  get through. That happens when the receiver predates `TypeTagged`: Send
+  recognises both the `ERR UNKNOWN(10) ...` answer of dataexchange v0.2.2 and
+  later and the `ACK UNKNOWN(10) <n> bytes` answer of v0.2.1 and older (every
+  stable daemon through v1.13.9), which drop the frame while acknowledging
+  it. It also happens when the header would push the frame over the max
+  frame size.
+- `MaxTaggedOverhead` (293 bytes) and `ErrTaggedFrameTooLarge`: the tagged
+  header counts toward `MaxFrameSize`, and `WriteFrame` refuses a tagged
+  frame that exceeds it, writing nothing, rather than send a frame the
+  receiver would drop the connection over.
+- Receiver-side duplicate suppression: an identical re-delivery of a stored
+  frame that carried a `MessageID` is acknowledged (`... (duplicate)`) but
+  not stored twice (`ServiceConfig.DedupeWindow`, default 10 min).
+  `ServiceConfig.DedupeContentWindow` (off by default) extends this to
+  frames without a `MessageID`.
+
 ### Security / hardening
 
 - Lower the default per-frame cap (`DefaultMaxFrameSize`) from 1 GiB to

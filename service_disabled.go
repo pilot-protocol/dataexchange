@@ -28,6 +28,8 @@ type ServiceConfig struct {
 	IncludeBase64                    bool
 	InboxMaxFiles                    int
 	InboxMaxBytes                    int64
+	DedupeWindow                     time.Duration
+	DedupeContentWindow              time.Duration
 	ReceivedMaxBytes                 int64
 	IdleTimeout                      time.Duration
 	RequireGoverned                  bool
