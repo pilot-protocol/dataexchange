@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -29,9 +30,17 @@ import (
 //
 // Compatibility: a frame without a MessageID or ReplyTo is written in the
 // original format, byte for byte, so nothing changes for peers that do not
-// use correlation. A receiver that predates TypeTagged answers a tagged
-// frame with "ERR UNKNOWN(10) ..." and stores nothing; Client.Send detects
-// that answer and re-sends the same frame untagged on the same connection.
+// use correlation. A receiver that predates TypeTagged stores nothing for a
+// tagged frame and answers "ACK UNKNOWN(10) ..." (v0.2.1 and older, which
+// silently drop unknown types) or "ERR UNKNOWN(10) ..." (v0.2.2 and later);
+// Client.Send recognises both and re-sends the same frame untagged on the
+// same connection.
+//
+// Size: the tagged wrapper adds 6 bytes plus the JSON header (at most
+// MaxTaggedOverhead bytes in all), and the whole wrapped frame must fit in
+// MaxFrameSize, because the receiver checks the outer length. WriteFrame
+// returns ErrTaggedFrameTooLarge rather than write a tagged frame that does
+// not fit; Client.Send then sends the frame untagged.
 
 // MaxMessageIDLen is the longest MessageID or ReplyTo value accepted on the
 // wire. IDs are 1..MaxMessageIDLen bytes of ASCII letters, digits, '-', '_',
@@ -43,6 +52,21 @@ const MaxMessageIDLen = 128
 // maximal IDs plus their keys fit comfortably; the cap keeps a hostile peer
 // from making the receiver parse a large JSON document per frame.
 const maxTaggedHeaderLen = 1024
+
+// MaxTaggedOverhead is the most a MessageID/ReplyTo header adds to a frame's
+// payload: the 2-byte header length, the JSON header with two
+// MaxMessageIDLen IDs ({"message_id":"…","reply_to":"…"}, 287 bytes) and the
+// 4-byte inner type. A frame stays taggable if its untagged payload is at
+// most MaxFrameSize - MaxTaggedOverhead bytes.
+const MaxTaggedOverhead = 2 + len(`{"message_id":"","reply_to":""}`) + 2*MaxMessageIDLen + 4
+
+// ErrTaggedFrameTooLarge is returned (wrapped) by WriteFrame when a frame
+// with a MessageID or ReplyTo would exceed MaxFrameSize once its header is
+// added. Nothing is written in that case. Client.Send handles it by sending
+// the frame untagged, which succeeds when the payload alone fits; a raw
+// WriteFrame caller can do the same, or shrink the payload by up to
+// MaxTaggedOverhead bytes.
+var ErrTaggedFrameTooLarge = errors.New("dataexchange: frame with MessageID/ReplyTo exceeds MaxFrameSize")
 
 // taggedHeader is the JSON header of a TypeTagged frame.
 type taggedHeader struct {
@@ -108,7 +132,14 @@ func taggedWirePayload(f *Frame) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := make([]byte, 2+len(header)+4+len(inner))
+	// Check before allocating: the receiver rejects an outer length over
+	// MaxFrameSize by dropping the connection, which the sender could not
+	// tell apart from a network failure.
+	size := uint64(2+len(header)+4) + uint64(len(inner))
+	if size > uint64(MaxFrameSize) {
+		return nil, fmt.Errorf("%w: %d bytes tagged (%d untagged), max %d", ErrTaggedFrameTooLarge, size, len(inner), MaxFrameSize)
+	}
+	out := make([]byte, size)
 	binary.BigEndian.PutUint16(out[0:2], uint16(len(header)))
 	copy(out[2:], header)
 	binary.BigEndian.PutUint32(out[2+len(header):], f.Type)

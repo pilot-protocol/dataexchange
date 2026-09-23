@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -451,16 +452,41 @@ func TestService_TaggedFileEventCarriesCorrelation(t *testing.T) {
 	}
 }
 
-// oldReceiver emulates a dataexchange receiver that predates TypeTagged: it
-// reads raw frames and answers exactly as the pre-TypeTagged service did.
-func oldReceiver(t *testing.T, governed bool) (clientEnd, func() []uint32, func() [][]byte) {
+// receiverGeneration is a dataexchange release line that predates
+// TypeTagged, as emulated by oldReceiver.
+type receiverGeneration int
+
+const (
+	// genDropUnknown is v0.1.0 through v0.2.1 (web4 v1.12.x through
+	// v1.13.9): handleConn has no case for an unknown type, so the frame is
+	// not stored and is still acknowledged "ACK UNKNOWN(<n>) <len> bytes".
+	genDropUnknown receiverGeneration = iota
+	// genRejectUnknown is v0.2.2 and later, before TypeTagged: an unknown
+	// type is answered "ERR UNKNOWN(<n>) save failed: unsupported frame type <n>".
+	genRejectUnknown
+	// genRejectUnknownGoverned is genRejectUnknown with RequireGoverned,
+	// which rejects every non-governed type before looking at it.
+	genRejectUnknownGoverned
+)
+
+func (g receiverGeneration) String() string {
+	return [...]string{"v0.2.1-and-older", "v0.2.2+", "v0.2.2+/governed"}[g]
+}
+
+var allOldReceiverGenerations = []receiverGeneration{genDropUnknown, genRejectUnknown, genRejectUnknownGoverned}
+
+// oldReceiver emulates a dataexchange receiver of generation gen, which
+// predates TypeTagged: it reads raw frames and answers exactly as that
+// release's service did. It returns the sender's end of the connection,
+// the types of all frames received, and the payloads the receiver stored.
+func oldReceiver(t *testing.T, gen receiverGeneration) (clientEnd, func() []uint32, func() [][]byte) {
 	t.Helper()
 	c2sR, c2sW := io.Pipe()
 	s2cR, s2cW := io.Pipe()
 	var (
-		mu       sync.Mutex
-		types    []uint32
-		payloads [][]byte
+		mu     sync.Mutex
+		types  []uint32
+		stored [][]byte
 	)
 	go func() {
 		defer s2cW.Close()
@@ -474,23 +500,23 @@ func oldReceiver(t *testing.T, governed bool) (clientEnd, func() []uint32, func(
 			if _, err := io.ReadFull(c2sR, payload); err != nil {
 				return
 			}
-			mu.Lock()
-			types = append(types, ftype)
-			payloads = append(payloads, payload)
-			mu.Unlock()
 			name, known := map[uint32]string{TypeText: "TEXT", TypeJSON: "JSON", TypeBinary: "BINARY"}[ftype]
 			if !known {
 				name = fmt.Sprintf("UNKNOWN(%d)", ftype)
 			}
 			ack := fmt.Sprintf("ACK %s %d bytes", name, len(payload))
 			switch {
-			case governed && ftype == TypeTagged:
-				// A RequireGoverned receiver rejects any non-governed type
-				// before looking at it.
+			case gen == genRejectUnknownGoverned && ftype == TypeTagged:
 				ack = fmt.Sprintf("ERR %s save failed: unsigned legacy frame rejected by governed receiver", name)
-			case !known:
+			case !known && gen != genDropUnknown:
 				ack = fmt.Sprintf("ERR %s save failed: unsupported frame type %d", name, ftype)
 			}
+			mu.Lock()
+			types = append(types, ftype)
+			if known {
+				stored = append(stored, payload)
+			}
+			mu.Unlock()
 			if err := WriteFrame(s2cW, &Frame{Type: TypeText, Payload: []byte(ack)}); err != nil {
 				return
 			}
@@ -498,43 +524,102 @@ func oldReceiver(t *testing.T, governed bool) (clientEnd, func() []uint32, func(
 	}()
 	t.Cleanup(func() { _ = c2sW.Close(); _ = s2cR.Close() })
 	seenTypes := func() []uint32 { mu.Lock(); defer mu.Unlock(); return append([]uint32(nil), types...) }
-	seenPayloads := func() [][]byte { mu.Lock(); defer mu.Unlock(); return append([][]byte(nil), payloads...) }
-	return clientEnd{r: s2cR, w: c2sW}, seenTypes, seenPayloads
+	storedPayloads := func() [][]byte { mu.Lock(); defer mu.Unlock(); return append([][]byte(nil), stored...) }
+	return clientEnd{r: s2cR, w: c2sW}, seenTypes, storedPayloads
 }
 
-// TestSend_FallsBackForOldReceiver: a sender using MessageID still reaches a
-// receiver that predates TypeTagged; the message arrives once, untagged.
+// TestSend_FallsBackForOldReceiver: a sender using MessageID still reaches
+// every receiver generation that predates TypeTagged; the message is stored
+// exactly once, untagged. The v0.2.1-and-older case is review finding
+// DX-REV-1: those receivers answer a tagged frame with a success ACK
+// ("ACK UNKNOWN(10) ...") while dropping it, and Send used to report it as
+// delivered with Tagged == true.
 func TestSend_FallsBackForOldReceiver(t *testing.T) {
 	t.Parallel()
-	for _, governed := range []bool{false, true} {
-		conn, types, payloads := oldReceiver(t, governed)
+	for _, gen := range allOldReceiverGenerations {
+		conn, types, stored := oldReceiver(t, gen)
 		res, err := sendAndAwaitAck(conn, &Frame{Type: TypeText, Payload: []byte("hello"), MessageID: "m-1", ReplyTo: "r-0"})
 		if err != nil {
-			t.Fatalf("governed=%v: send: %v", governed, err)
+			t.Fatalf("%v: send: %v", gen, err)
 		}
 		if res.Tagged || res.Duplicate || string(res.Ack.Payload) != "ACK TEXT 5 bytes" {
-			t.Fatalf("governed=%v: result=%+v ack=%q", governed, res, res.Ack.Payload)
+			t.Fatalf("%v: result=%+v ack=%q", gen, res, res.Ack.Payload)
 		}
 		if got := types(); len(got) != 2 || got[0] != TypeTagged || got[1] != TypeText {
-			t.Fatalf("governed=%v: old receiver saw types %v, want [TAGGED TEXT]", governed, got)
+			t.Fatalf("%v: old receiver saw types %v, want [TAGGED TEXT]", gen, got)
 		}
-		if got := payloads(); string(got[1]) != "hello" {
-			t.Fatalf("governed=%v: fallback payload = %q", governed, got[1])
+		if got := stored(); len(got) != 1 || string(got[0]) != "hello" {
+			t.Fatalf("%v: old receiver stored %q, want exactly [hello]", gen, got)
 		}
 	}
 }
 
 // TestSend_UntaggedFrameNeverRetried: a frame without metadata is sent once,
-// even when the receiver rejects it.
+// whatever the receiver answers.
 func TestSend_UntaggedFrameNeverRetried(t *testing.T) {
 	t.Parallel()
-	conn, types, _ := oldReceiver(t, false)
-	res, err := sendAndAwaitAck(conn, &Frame{Type: 99, Payload: []byte("x")})
-	if !errors.Is(err, ErrRejected) || res == nil {
-		t.Fatalf("res=%+v err=%v, want ErrRejected", res, err)
+	for _, gen := range allOldReceiverGenerations {
+		conn, types, _ := oldReceiver(t, gen)
+		res, err := sendAndAwaitAck(conn, &Frame{Type: 99, Payload: []byte("x")})
+		if res == nil || (gen != genDropUnknown && !errors.Is(err, ErrRejected)) {
+			t.Fatalf("%v: res=%+v err=%v, want ErrRejected", gen, res, err)
+		}
+		if got := types(); len(got) != 1 {
+			t.Fatalf("%v: receiver saw %d frames, want 1", gen, len(got))
+		}
 	}
-	if got := types(); len(got) != 1 {
-		t.Fatalf("receiver saw %d frames, want 1", len(got))
+}
+
+// TestReceiverPredatesTagged pins which acknowledgements trigger the
+// untagged re-send. Only a receiver that does not know type 10 names it
+// "UNKNOWN(10)"; a current receiver acknowledges the unwrapped inner type.
+func TestReceiverPredatesTagged(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		ack  *Frame
+		want bool
+	}{
+		{&Frame{Type: TypeText, Payload: []byte("ACK UNKNOWN(10) 42 bytes")}, true},
+		{&Frame{Type: TypeText, Payload: []byte("ERR UNKNOWN(10) save failed: unsupported frame type 10")}, true},
+		{&Frame{Type: TypeText, Payload: []byte("ERR UNKNOWN(10) save failed: unsigned legacy frame rejected by governed receiver")}, true},
+		{&Frame{Type: TypeText, Payload: []byte("ACK TEXT 5 bytes")}, false},
+		{&Frame{Type: TypeText, Payload: []byte("ACK TEXT 5 bytes (duplicate)")}, false},
+		{&Frame{Type: TypeText, Payload: []byte("ERR TEXT save failed: inbox byte budget exceeded")}, false},
+		{&Frame{Type: TypeText, Payload: []byte("ACK UNKNOWN(11) 3 bytes")}, false},
+		{&Frame{Type: TypeText, Payload: []byte("ACK UNKNOWN(100) 3 bytes")}, false},
+		{&Frame{Type: TypeText, Payload: []byte("ERR UNKNOWN(11) save failed: unsupported frame type 11")}, false},
+		{&Frame{Type: TypeJSON, Payload: []byte("ACK UNKNOWN(10) 42 bytes")}, false},
+		{&Frame{Type: TypeText, Payload: nil}, false},
+	} {
+		if got := receiverPredatesTagged(tc.ack); got != tc.want {
+			t.Errorf("receiverPredatesTagged(%d %q) = %v, want %v", tc.ack.Type, tc.ack.Payload, got, tc.want)
+		}
+	}
+}
+
+// TestSend_CurrentReceiverKeepsTagsForEveryType: a current receiver never
+// answers in a way that triggers the fallback, whatever the inner type.
+func TestSend_CurrentReceiverKeepsTagsForEveryType(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	conn := openServiceConn(t, NewService(ServiceConfig{InboxDir: tmp, ReceivedDir: filepath.Join(tmp, "received")}), peerA)
+	for _, f := range []*Frame{
+		{Type: TypeText, Payload: []byte("t")},
+		{Type: TypeJSON, Payload: []byte(`{"a":1}`)},
+		{Type: TypeBinary, Payload: []byte{0, 1, 2}},
+		{Type: TypeFile, Filename: "f.txt", Payload: []byte("file")},
+	} {
+		f.MessageID = NewMessageID()
+		res := mustSend(t, conn, f)
+		if !res.Tagged || receiverPredatesTagged(res.Ack) || !strings.HasPrefix(string(res.Ack.Payload), "ACK "+TypeName(f.Type)+" ") {
+			t.Fatalf("type %s: result=%+v ack=%q", TypeName(f.Type), res, res.Ack.Payload)
+		}
+	}
+	// An unknown inner type is rejected under its own name, not UNKNOWN(10),
+	// so it is not mistaken for an old receiver and re-sent.
+	res, err := sendAndAwaitAck(conn, &Frame{Type: 99, Payload: []byte("x"), MessageID: NewMessageID()})
+	if !errors.Is(err, ErrRejected) || res == nil || !res.Tagged || !strings.HasPrefix(string(res.Ack.Payload), "ERR UNKNOWN(99) ") {
+		t.Fatalf("unknown inner type: res=%+v err=%v", res, err)
 	}
 }
 
@@ -562,6 +647,72 @@ func TestSend_NilFrame(t *testing.T) {
 	t.Parallel()
 	if _, err := sendAndAwaitAck(clientEnd{}, nil); err == nil {
 		t.Fatal("nil frame accepted")
+	}
+}
+
+// smallCapChildEnv marks the child process of
+// TestSend_TaggedFrameSizeEndToEndSmallCap.
+const smallCapChildEnv = "DATAEXCHANGE_TEST_SMALL_CAP_CHILD"
+
+// TestSend_TaggedFrameSizeEndToEndSmallCap reproduces review finding
+// DX-REV-3 against a real Service. MaxFrameSize is fixed at process start
+// from PILOT_DATAEXCHANGE_MAX_FRAME, so the test re-runs itself in a child
+// process with a 64 KiB cap. A frame of exactly the cap used to be sent
+// tagged, over the cap: the receiver dropped the connection and Send
+// returned a transport error with nothing stored.
+func TestSend_TaggedFrameSizeEndToEndSmallCap(t *testing.T) {
+	if os.Getenv(smallCapChildEnv) != "1" {
+		t.Parallel()
+		cmd := exec.Command(os.Args[0], "-test.run=^TestSend_TaggedFrameSizeEndToEndSmallCap$", "-test.v", "-test.count=1")
+		cmd.Env = append(os.Environ(), smallCapChildEnv+"=1", "PILOT_DATAEXCHANGE_MAX_FRAME=65536")
+		out, err := cmd.CombinedOutput()
+		if err != nil || !strings.Contains(string(out), "--- PASS: TestSend_TaggedFrameSizeEndToEndSmallCap") {
+			t.Fatalf("child run failed (err %v):\n%s", err, out)
+		}
+		return
+	}
+
+	if MaxFrameSize != 65536 {
+		t.Fatalf("MaxFrameSize = %d, want 65536 from PILOT_DATAEXCHANGE_MAX_FRAME", MaxFrameSize)
+	}
+	tmp := t.TempDir()
+	conn := openServiceConn(t, NewService(ServiceConfig{InboxDir: tmp}), peerA)
+
+	// A frame at the cap fits only untagged, so it is delivered untagged.
+	atCap := &Frame{Type: TypeBinary, Payload: make([]byte, MaxFrameSize), MessageID: NewMessageID()}
+	res, err := sendAndAwaitAck(conn, atCap)
+	if err != nil {
+		t.Fatalf("frame at the cap: %v", err)
+	}
+	if want := fmt.Sprintf("ACK BINARY %d bytes", MaxFrameSize); res.Tagged || string(res.Ack.Payload) != want {
+		t.Fatalf("frame at the cap: result=%+v ack=%q, want untagged %q", res, res.Ack.Payload, want)
+	}
+
+	// The largest payload that stays taggable with two maximal IDs is
+	// delivered tagged, on the same connection.
+	id := strings.Repeat("i", MaxMessageIDLen)
+	reply := strings.Repeat("r", MaxMessageIDLen)
+	fits := &Frame{Type: TypeBinary, Payload: make([]byte, int(MaxFrameSize)-MaxTaggedOverhead), MessageID: id, ReplyTo: reply}
+	res = mustSend(t, conn, fits)
+	if want := fmt.Sprintf("ACK BINARY %d bytes", len(fits.Payload)); !res.Tagged || string(res.Ack.Payload) != want {
+		t.Fatalf("largest taggable frame: result=%+v ack=%q, want tagged %q", res, res.Ack.Payload, want)
+	}
+
+	recs := inboxRecords(t, tmp)
+	if len(recs) != 2 {
+		t.Fatalf("inbox records = %d, want 2", len(recs))
+	}
+	if _, ok := recs[0]["message_id"]; ok || recs[0]["bytes"] != float64(MaxFrameSize) {
+		t.Fatalf("frame at the cap stored as %v, want %d bytes without message_id", recs[0]["bytes"], MaxFrameSize)
+	}
+	if recs[1]["message_id"] != id || recs[1]["reply_to"] != reply {
+		t.Fatalf("largest taggable frame stored with message_id=%v reply_to=%v", recs[1]["message_id"], recs[1]["reply_to"])
+	}
+
+	// A raw WriteFrame of the oversized tagged frame fails without writing.
+	var w countingWriter
+	if err := WriteFrame(&w, atCap); !errors.Is(err, ErrTaggedFrameTooLarge) || w.n != 0 {
+		t.Fatalf("raw WriteFrame: err=%v wrote %d bytes, want ErrTaggedFrameTooLarge and 0", err, w.n)
 	}
 }
 

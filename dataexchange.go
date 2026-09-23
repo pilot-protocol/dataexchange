@@ -171,8 +171,10 @@ func wirePayload(f *Frame) ([]byte, error) {
 
 // WriteFrame writes a frame to a writer. A frame with MessageID or ReplyTo
 // set is written as a TypeTagged wrapper around its own type; receivers that
-// predate TypeTagged reject it, so prefer Client.Send, which falls back to
-// the untagged form for them.
+// predate TypeTagged do not store it, so prefer Client.Send, which falls back
+// to the untagged form for them. If the wrapper would push the frame over
+// MaxFrameSize, WriteFrame writes nothing and returns an error wrapping
+// ErrTaggedFrameTooLarge.
 func WriteFrame(w io.Writer, f *Frame) error {
 	ftype := f.Type
 	var (

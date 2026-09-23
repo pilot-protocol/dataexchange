@@ -38,8 +38,12 @@ type SendResult struct {
 	// "ACK <TYPE> <n> bytes" (or "ERR ..." on rejection).
 	Ack *Frame
 	// Tagged is true when the frame's MessageID/ReplyTo reached the
-	// receiver. It is false when the frame carried neither, or when the
-	// receiver predates TypeTagged and the frame was delivered untagged.
+	// receiver. It is false when the frame carried neither, and also when
+	// Send delivered the frame without them: because the receiver predates
+	// TypeTagged, or because the tagged header would have pushed the frame
+	// over MaxFrameSize (see ErrTaggedFrameTooLarge). A requester that sees
+	// Tagged == false cannot expect a reply carrying reply_to, and should
+	// match the answer on the sender alone.
 	Tagged bool
 	// Duplicate is true when the receiver recognised the frame as an
 	// identical re-delivery of one it had already stored, and did not store
@@ -52,16 +56,53 @@ type SendResult struct {
 // that only check the prefix keep treating it as success.
 const duplicateAckSuffix = " (duplicate)"
 
-// untaggedReceiverAckPrefix is how a receiver that predates TypeTagged
-// answers a tagged frame: it does not know type 10, stores nothing, and
-// replies "ERR UNKNOWN(10) save failed: ...".
-var untaggedReceiverAckPrefix = fmt.Sprintf("ERR UNKNOWN(%d) ", TypeTagged)
+// untaggedReceiverAckPrefixes are the two ways a receiver that predates
+// TypeTagged answers a tagged frame. Neither kind stores anything:
+//
+//   - dataexchange v0.1.0 through v0.2.1 (and the pseudo-versions between
+//     them) have no case for an unknown frame type. The frame matches
+//     nothing, no save is attempted, and the receiver answers
+//     "ACK UNKNOWN(10) <n> bytes": a success ACK for a frame it dropped.
+//   - dataexchange v0.2.2 and later, before TypeTagged, reject an unknown
+//     type and answer "ERR UNKNOWN(10) save failed: unsupported frame type 10".
+//     A RequireGoverned receiver answers "ERR UNKNOWN(10) save failed:
+//     unsigned legacy frame ..." instead, also without storing it.
+//
+// A receiver that knows TypeTagged unwraps the frame in ReadFrame and
+// acknowledges the inner type (which can never be TypeTagged), so its ACK
+// never starts with either prefix.
+var untaggedReceiverAckPrefixes = [...]string{
+	fmt.Sprintf("ACK UNKNOWN(%d) ", TypeTagged),
+	fmt.Sprintf("ERR UNKNOWN(%d) ", TypeTagged),
+}
+
+// receiverPredatesTagged reports whether ack is a pre-TypeTagged receiver's
+// answer to a tagged frame, which means the frame was not stored.
+func receiverPredatesTagged(ack *Frame) bool {
+	if ack.Type != TypeText {
+		return false
+	}
+	for _, prefix := range untaggedReceiverAckPrefixes {
+		if strings.HasPrefix(string(ack.Payload), prefix) {
+			return true
+		}
+	}
+	return false
+}
 
 // Send writes frame, waits for the receiver's acknowledgement and reports
 // the outcome. It is the preferred way to send a frame that carries a
-// MessageID or ReplyTo: if the receiver predates TypeTagged, Send re-sends
-// the same frame without the metadata on the same connection, so older peers
-// still get the message (they could not have stored the tagged copy).
+// MessageID or ReplyTo, because it delivers the frame untagged (and reports
+// SendResult.Tagged == false) in the two cases where the tagged form cannot
+// get through:
+//
+//   - The receiver predates TypeTagged. Send recognises its answer (see
+//     untaggedReceiverAckPrefixes) and re-sends the same frame without the
+//     metadata on the same connection. Such a receiver never stores the
+//     tagged copy, so the message is stored exactly once.
+//   - The tagged header would push the frame over MaxFrameSize. Send writes
+//     the frame untagged in the first place instead of sending a frame the
+//     receiver would drop the connection over.
 //
 // If the receiver answers "ERR ...", Send returns the result together with
 // an error wrapping ErrRejected. Send reads from the connection, so do not
@@ -70,22 +111,33 @@ func (c *Client) Send(frame *Frame) (*SendResult, error) {
 	return sendAndAwaitAck(c.conn, frame)
 }
 
+// withoutTags returns a copy of frame without MessageID and ReplyTo.
+func withoutTags(frame *Frame) *Frame {
+	plain := *frame
+	plain.MessageID, plain.ReplyTo = "", ""
+	return &plain
+}
+
 func sendAndAwaitAck(rw io.ReadWriter, frame *Frame) (*SendResult, error) {
 	if frame == nil {
 		return nil, fmt.Errorf("dataexchange: frame is required")
 	}
 	tagged := frame.MessageID != "" || frame.ReplyTo != ""
-	if err := WriteFrame(rw, frame); err != nil {
+	err := WriteFrame(rw, frame)
+	if tagged && errors.Is(err, ErrTaggedFrameTooLarge) {
+		// WriteFrame wrote nothing. The frame fits only without its header.
+		tagged = false
+		err = WriteFrame(rw, withoutTags(frame))
+	}
+	if err != nil {
 		return nil, err
 	}
 	ack, err := ReadFrame(rw)
 	if err != nil {
 		return nil, fmt.Errorf("dataexchange: read ack: %w", err)
 	}
-	if tagged && ack.Type == TypeText && strings.HasPrefix(string(ack.Payload), untaggedReceiverAckPrefix) {
-		plain := *frame
-		plain.MessageID, plain.ReplyTo = "", ""
-		if err := WriteFrame(rw, &plain); err != nil {
+	if tagged && receiverPredatesTagged(ack) {
+		if err := WriteFrame(rw, withoutTags(frame)); err != nil {
 			return nil, err
 		}
 		if ack, err = ReadFrame(rw); err != nil {

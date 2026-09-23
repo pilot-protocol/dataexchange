@@ -31,8 +31,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inbox JSON and `message.received` / `file.received` events as
   `message_id` / `reply_to`. Frames without them are byte-for-byte
   unchanged. `NewMessageID` and `ValidMessageID` helpers.
-- `Client.Send`, which waits for the ACK and, when the receiver predates
-  `TypeTagged`, re-sends the frame untagged so older peers still get it.
+- `Client.Send`, which waits for the ACK and delivers a tagged frame
+  untagged, with `SendResult.Tagged == false`, when the tagged form cannot
+  get through. That happens when the receiver predates `TypeTagged`: Send
+  recognises both the `ERR UNKNOWN(10) ...` answer of dataexchange v0.2.2 and
+  later and the `ACK UNKNOWN(10) <n> bytes` answer of v0.2.1 and older (every
+  stable daemon through v1.13.9), which drop the frame while acknowledging
+  it. It also happens when the header would push the frame over the max
+  frame size.
+- `MaxTaggedOverhead` (293 bytes) and `ErrTaggedFrameTooLarge`: the tagged
+  header counts toward `MaxFrameSize`, and `WriteFrame` refuses a tagged
+  frame that exceeds it, writing nothing, rather than send a frame the
+  receiver would drop the connection over.
 - Receiver-side duplicate suppression: an identical re-delivery of a stored
   frame that carried a `MessageID` is acknowledged (`... (duplicate)`) but
   not stored twice (`ServiceConfig.DedupeWindow`, default 10 min).

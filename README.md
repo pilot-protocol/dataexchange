@@ -53,7 +53,9 @@ For `TypeTagged` (10) the payload is
 see [Request/reply correlation](#requestreply-correlation-for-service-authors).
 
 Max frame size: 64 MiB by default (configurable at process start with
-`PILOT_DATAEXCHANGE_MAX_FRAME` within its documented safe range).
+`PILOT_DATAEXCHANGE_MAX_FRAME` within its documented safe range). The limit
+applies to the whole payload after the 8-byte header, so for `TypeTagged` it
+includes the correlation header (see below).
 
 ## Inbox
 
@@ -123,14 +125,30 @@ Services that predate this field answer without `reply_to`; for those, fall
 back to matching on the sender alone.
 
 **Compatibility.** Frames without either field use the original wire format,
-byte for byte. A frame with either field travels as `TypeTagged`. Receivers
-that predate it answer `ERR UNKNOWN(10) ...` and store nothing; `Client.Send`
-detects that answer, re-sends the same frame without the fields on the same
-connection, and reports `SendResult.Tagged == false`, so a new sender can
-always talk to an old receiver. (A raw `WriteFrame` of a tagged frame does
-not do this fallback — use `Client.Send`.) The fields can accompany text,
-JSON, binary, file, governed and trace frames; on `TypeFileStream` frames
-they are ignored.
+byte for byte. A frame with either field travels as `TypeTagged`. A receiver
+that predates it stores nothing and answers in one of two ways:
+
+- dataexchange v0.2.1 and older (every stable pilot daemon through v1.13.9)
+  has no case for an unknown frame type. It drops the frame and still
+  answers `ACK UNKNOWN(10) <n> bytes`.
+- dataexchange v0.2.2 and later answers `ERR UNKNOWN(10) save failed: ...`.
+
+`Client.Send` recognises both answers, re-sends the same frame without the
+fields on the same connection, and reports `SendResult.Tagged == false`, so a
+new sender can always talk to an old receiver and the message is stored
+exactly once. A raw `WriteFrame` of a tagged frame does not fall back:
+against a v0.2.1-or-older receiver the message is silently lost, so use
+`Client.Send`.
+
+**Size.** The tagged header adds up to `MaxTaggedOverhead` (293) bytes, and
+the whole tagged frame must fit in the max frame size. A payload within 293
+bytes of the limit may fit only untagged. `Client.Send` then sends it
+untagged (`SendResult.Tagged == false`), and a raw `WriteFrame` returns
+`ErrTaggedFrameTooLarge` without writing anything.
+
+Whenever `Tagged` is false, the reply cannot carry `reply_to`; match it on
+the sender alone. The fields can accompany text, JSON, binary, file,
+governed and trace frames. On `TypeFileStream` frames they are ignored.
 
 Wire layout of a tagged frame, for other languages:
 
@@ -139,6 +157,7 @@ Wire layout of a tagged frame, for other languages:
 payload = [2-byte header_len, 1..1024][header_len bytes: JSON object]
           [4-byte inner_type][inner payload, exactly as the inner type sends it]
 header  = {"message_id":"…","reply_to":"…"}   (both optional; unknown keys are ignored)
+length  = 2 + header_len + 4 + len(inner payload), at most the max frame size
 ```
 
 **Duplicate deliveries.** The receiver remembers every stored frame that

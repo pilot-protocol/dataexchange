@@ -5,6 +5,9 @@ package dataexchange
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -290,4 +293,125 @@ func TestClient_Send_TaggedThroughDriver(t *testing.T) {
 		t.Fatal("Send did not return after the ACK")
 	}
 	_ = c.Close()
+}
+
+// TestMaxTaggedOverhead: the documented worst-case header overhead is what
+// two maximal IDs actually cost on the wire.
+func TestMaxTaggedOverhead(t *testing.T) {
+	t.Parallel()
+	id := strings.Repeat("x", MaxMessageIDLen)
+	payload, err := taggedWirePayload(&Frame{Type: TypeText, MessageID: id, ReplyTo: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(payload) != MaxTaggedOverhead || MaxTaggedOverhead != 293 {
+		t.Fatalf("maximal tagged overhead = %d bytes, MaxTaggedOverhead = %d, want both 293", len(payload), MaxTaggedOverhead)
+	}
+}
+
+// countingWriter counts bytes written and discards them.
+type countingWriter struct{ n int }
+
+func (w *countingWriter) Write(p []byte) (int, error) { w.n += len(p); return len(p), nil }
+
+// TestWriteFrame_TaggedFrameOverMaxFrameSize is part of review finding
+// DX-REV-3: the tagged wrapper must not push a frame past MaxFrameSize,
+// where the receiver would drop the connection. WriteFrame refuses such a
+// frame before writing anything, and accepts one that fits exactly.
+func TestWriteFrame_TaggedFrameOverMaxFrameSize(t *testing.T) {
+	t.Parallel()
+	overhead, err := taggedWirePayload(&Frame{Type: TypeBinary, MessageID: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Untouched zero pages: this does not commit MaxFrameSize bytes of RAM
+	// until a write copies them.
+	big := make([]byte, MaxFrameSize)
+
+	for _, tc := range []struct {
+		name string
+		n    int
+	}{
+		{"untagged size at the cap", int(MaxFrameSize)},
+		{"one byte over once tagged", int(MaxFrameSize) - len(overhead) + 1},
+	} {
+		var w countingWriter
+		err := WriteFrame(&w, &Frame{Type: TypeBinary, Payload: big[:tc.n], MessageID: "m"})
+		if !errors.Is(err, ErrTaggedFrameTooLarge) {
+			t.Fatalf("%s: err = %v, want ErrTaggedFrameTooLarge", tc.name, err)
+		}
+		if w.n != 0 {
+			t.Fatalf("%s: %d bytes written before the error, want 0", tc.name, w.n)
+		}
+	}
+
+	var w countingWriter
+	if err := WriteFrame(&w, &Frame{Type: TypeBinary, Payload: big[:int(MaxFrameSize)-len(overhead)], MessageID: "m"}); err != nil {
+		t.Fatalf("tagged frame that fits exactly: %v", err)
+	}
+	if w.n != 8+int(MaxFrameSize) {
+		t.Fatalf("exact fit wrote %d bytes, want %d", w.n, 8+int(MaxFrameSize))
+	}
+}
+
+// TestSend_TaggedFrameTooLargeSentUntagged: Client.Send delivers a frame
+// that fits only untagged, untagged, and reports Tagged == false.
+func TestSend_TaggedFrameTooLargeSentUntagged(t *testing.T) {
+	t.Parallel()
+	c2sR, c2sW := io.Pipe()
+	s2cR, s2cW := io.Pipe()
+	t.Cleanup(func() { _ = c2sW.Close(); _ = s2cR.Close() })
+	type seen struct {
+		ftype  uint32
+		length uint32
+	}
+	frames := make(chan seen, 4)
+	go func() {
+		// A receiver that checks the outer length like ReadFrame does but
+		// discards the payload, so the test does not buffer 64 MiB.
+		defer s2cW.Close()
+		for {
+			var hdr [8]byte
+			if _, err := io.ReadFull(c2sR, hdr[:]); err != nil {
+				return
+			}
+			ftype, length := binary.BigEndian.Uint32(hdr[0:4]), binary.BigEndian.Uint32(hdr[4:8])
+			frames <- seen{ftype, length}
+			if length > MaxFrameSize {
+				// "frame too large": the receiver drops the connection,
+				// which fails the sender's pending write.
+				_ = c2sR.CloseWithError(errors.New("receiver dropped the connection: frame too large"))
+				return
+			}
+			if _, err := io.CopyN(io.Discard, c2sR, int64(length)); err != nil {
+				return
+			}
+			ack := fmt.Sprintf("ACK %s %d bytes", TypeName(ftype), length)
+			if err := WriteFrame(s2cW, &Frame{Type: TypeText, Payload: []byte(ack)}); err != nil {
+				return
+			}
+		}
+	}()
+
+	payload := make([]byte, MaxFrameSize)
+	conn := struct {
+		io.Reader
+		io.Writer
+	}{s2cR, c2sW}
+	res, err := sendAndAwaitAck(conn, &Frame{Type: TypeBinary, Payload: payload, MessageID: NewMessageID()})
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	want := fmt.Sprintf("ACK BINARY %d bytes", MaxFrameSize)
+	if res.Tagged || string(res.Ack.Payload) != want {
+		t.Fatalf("result = %+v ack = %q, want untagged %q", res, res.Ack.Payload, want)
+	}
+	if got := <-frames; got.ftype != TypeBinary || got.length != MaxFrameSize {
+		t.Fatalf("receiver saw type %d length %d, want one untagged BINARY frame of %d bytes", got.ftype, got.length, MaxFrameSize)
+	}
+	select {
+	case extra := <-frames:
+		t.Fatalf("receiver saw a second frame %+v", extra)
+	default:
+	}
 }
