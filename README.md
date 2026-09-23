@@ -35,6 +35,7 @@ rt.Register(dataexchange.NewService(dataexchange.ServiceConfig{}))
 | `governed.go` | Signed decision envelope, receiver-side verifier, and enforceable transport constraints. |
 | `server.go` | `Server` — accept loop and handler dispatch. |
 | `service.go` | `*Service` — `coreapi.Service` adapter. Build tag `!no_dataexchange`. |
+| `inbox_budget.go` | Inbox caps: running byte total, oldest-first eviction to 90% of the byte cap, file-count cap. |
 | `service_disabled.go` | Stub `*Service` for `-tags no_dataexchange` builds. |
 
 ## Wire format
@@ -48,6 +49,30 @@ For `TypeTrace` the payload is `[4-byte inner_type][8-byte sent_at_ns][inner pay
 
 Max frame size: 64 MiB by default (configurable at process start with
 `PILOT_DATAEXCHANGE_MAX_FRAME` within its documented safe range).
+
+## Inbox
+
+Text, JSON and binary messages are written to `~/.pilot/inbox/` as one JSON
+file each:
+
+```json
+{"type":"TEXT","from":"0:0000.0002.BBE4","bytes":5,"received_at":"2026-09-24T10:00:00.123456789Z",
+ "data":"hello","data_encoding":"utf8"}
+```
+
+Binary or non-UTF-8 payloads are stored as `data_b64` with
+`"data_encoding":"base64"`.
+
+Two caps bound the inbox, and both evict the **oldest** messages first:
+
+- `ServiceConfig.InboxMaxFiles` (default 10000), checked every 64 messages.
+- `ServiceConfig.InboxMaxBytes` (default 256 MiB), checked before every write
+  against a running byte total (no directory scan per message). When a new
+  message would not fit, the oldest messages are removed until the inbox plus
+  the new message is at or below 90% of the cap, so recent replies survive
+  and the next messages do not each trigger another eviction. A single
+  message larger than the cap is rejected without evicting anything. A
+  negative value disables the byte cap.
 
 ## Governed delivery
 
