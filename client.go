@@ -3,8 +3,10 @@
 package dataexchange
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/pilot-protocol/common/decision"
@@ -24,6 +26,83 @@ func Dial(d *driver.Driver, addr protocol.Addr) (*Client, error) {
 		return nil, err
 	}
 	return &Client{conn: conn}, nil
+}
+
+// ErrRejected is wrapped by the error Client.Send returns when the receiver
+// answered with an "ERR ..." acknowledgement instead of storing the frame.
+var ErrRejected = errors.New("dataexchange: receiver rejected frame")
+
+// SendResult reports what the receiver did with a frame sent by Client.Send.
+type SendResult struct {
+	// Ack is the receiver's acknowledgement frame, normally a TypeText
+	// "ACK <TYPE> <n> bytes" (or "ERR ..." on rejection).
+	Ack *Frame
+	// Tagged is true when the frame's MessageID/ReplyTo reached the
+	// receiver. It is false when the frame carried neither, or when the
+	// receiver predates TypeTagged and the frame was delivered untagged.
+	Tagged bool
+	// Duplicate is true when the receiver recognised the frame as an
+	// identical re-delivery of one it had already stored, and did not store
+	// it a second time.
+	Duplicate bool
+}
+
+// duplicateAckSuffix is appended to the ACK of a frame the receiver
+// suppressed as a duplicate. The ACK still starts with "ACK ", so senders
+// that only check the prefix keep treating it as success.
+const duplicateAckSuffix = " (duplicate)"
+
+// untaggedReceiverAckPrefix is how a receiver that predates TypeTagged
+// answers a tagged frame: it does not know type 10, stores nothing, and
+// replies "ERR UNKNOWN(10) save failed: ...".
+var untaggedReceiverAckPrefix = fmt.Sprintf("ERR UNKNOWN(%d) ", TypeTagged)
+
+// Send writes frame, waits for the receiver's acknowledgement and reports
+// the outcome. It is the preferred way to send a frame that carries a
+// MessageID or ReplyTo: if the receiver predates TypeTagged, Send re-sends
+// the same frame without the metadata on the same connection, so older peers
+// still get the message (they could not have stored the tagged copy).
+//
+// If the receiver answers "ERR ...", Send returns the result together with
+// an error wrapping ErrRejected. Send reads from the connection, so do not
+// use it concurrently with Recv on the same Client.
+func (c *Client) Send(frame *Frame) (*SendResult, error) {
+	return sendAndAwaitAck(c.conn, frame)
+}
+
+func sendAndAwaitAck(rw io.ReadWriter, frame *Frame) (*SendResult, error) {
+	if frame == nil {
+		return nil, fmt.Errorf("dataexchange: frame is required")
+	}
+	tagged := frame.MessageID != "" || frame.ReplyTo != ""
+	if err := WriteFrame(rw, frame); err != nil {
+		return nil, err
+	}
+	ack, err := ReadFrame(rw)
+	if err != nil {
+		return nil, fmt.Errorf("dataexchange: read ack: %w", err)
+	}
+	if tagged && ack.Type == TypeText && strings.HasPrefix(string(ack.Payload), untaggedReceiverAckPrefix) {
+		plain := *frame
+		plain.MessageID, plain.ReplyTo = "", ""
+		if err := WriteFrame(rw, &plain); err != nil {
+			return nil, err
+		}
+		if ack, err = ReadFrame(rw); err != nil {
+			return nil, fmt.Errorf("dataexchange: read ack: %w", err)
+		}
+		tagged = false
+	}
+	text := string(ack.Payload)
+	result := &SendResult{
+		Ack:       ack,
+		Tagged:    tagged,
+		Duplicate: ack.Type == TypeText && strings.HasPrefix(text, "ACK ") && strings.HasSuffix(text, duplicateAckSuffix),
+	}
+	if ack.Type == TypeText && strings.HasPrefix(text, "ERR ") {
+		return result, fmt.Errorf("%w: %s", ErrRejected, text)
+	}
+	return result, nil
 }
 
 // SendText sends a text frame.

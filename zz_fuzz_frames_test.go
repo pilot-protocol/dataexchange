@@ -43,6 +43,13 @@ func FuzzDataExchangeRoundTrip(f *testing.F) {
 		if len(payload) > 1<<20 { // keep manageable
 			payload = payload[:1<<20]
 		}
+		if ftype == dataexchange.TypeTagged {
+			// TypeTagged is produced by WriteFrame from MessageID/ReplyTo and
+			// unwrapped by ReadFrame, so a raw payload of that type does not
+			// round-trip; FuzzTaggedFrameRoundTrip / FuzzTaggedFrameRead
+			// cover it.
+			return
+		}
 
 		frame := &dataexchange.Frame{Type: ftype, Payload: payload}
 		var buf bytes.Buffer

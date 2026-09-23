@@ -46,6 +46,20 @@ type ServiceConfig struct {
 	// cap is rejected without evicting anything. Zero ⇒ DefaultInboxMaxBytes;
 	// a negative value disables the byte cap entirely (escape hatch).
 	InboxMaxBytes int64
+	// DedupeWindow is how long a stored frame that carried a MessageID is
+	// remembered, so an identical re-delivery (same sender, MessageID,
+	// ReplyTo, type, filename and bytes) is acknowledged without being
+	// stored again. Zero ⇒ DefaultDedupeWindow (10 min); negative disables.
+	// Frames without a MessageID are unaffected unless DedupeContentWindow
+	// is set.
+	DedupeWindow time.Duration
+	// DedupeContentWindow, when positive, also suppresses byte-identical
+	// frames WITHOUT a MessageID from the same sender that arrive within this
+	// window (for example a peer that answers one request over two paths).
+	// Zero (the default) keeps the historical behaviour of storing every
+	// such frame: two identical legacy messages can be deliberate, and a
+	// sender cannot mark them otherwise. Keep it short (a few seconds).
+	DedupeContentWindow time.Duration
 	// ReceivedMaxBytes caps the total on-disk bytes used by the received-
 	// files directory (completed TypeFile / TypeFileStream files plus any
 	// retained .partial fragments). Enforced before every write so a peer
@@ -162,6 +176,11 @@ type Service struct {
 	retention *governedRetentionManager
 	replay    *governedReplayGuard
 	inbox     inboxBudget
+	// dedupeByID remembers stored frames that carried a MessageID;
+	// dedupeByContent (nil unless DedupeContentWindow > 0) remembers frames
+	// without one. See dedupe.go.
+	dedupeByID      *deliveryDedupe
+	dedupeByContent *deliveryDedupe
 }
 
 // persistedDelivery separates a disk write from its visible notification so a
@@ -174,7 +193,14 @@ type persistedDelivery struct {
 }
 
 func NewService(cfg ServiceConfig) *Service {
-	return &Service{cfg: cfg, replay: newGovernedReplayGuard()}
+	s := &Service{cfg: cfg, replay: newGovernedReplayGuard()}
+	if window := s.effectiveDedupeWindow(); window > 0 {
+		s.dedupeByID = newDeliveryDedupe(window, dedupeMaxEntries)
+	}
+	if cfg.DedupeContentWindow > 0 {
+		s.dedupeByContent = newDeliveryDedupe(cfg.DedupeContentWindow, dedupeMaxEntries)
+	}
+	return s
 }
 
 func (s *Service) Name() string { return "dataexchange" }
@@ -325,7 +351,12 @@ func (s *Service) handleConn(ctx context.Context, conn coreapi.Stream) {
 	var sr *StreamReceiver
 	governedStreams := make(map[[transferIDLen]byte]GovernedStreamInit)
 	streamRetention := make(map[[transferIDLen]byte]retentionTicket)
+	// claim is the dedupe claim for the frame being processed. If handling
+	// unwinds early (a panic), releasing it as "not stored" lets any
+	// identical delivery waiting on it proceed instead of hanging.
+	var claim dedupeClaim
 	defer func() {
+		claim.finish(false, "")
 		for _, ticket := range streamRetention {
 			_ = ticket.rollback()
 		}
@@ -413,10 +444,37 @@ func (s *Service) handleConn(ctx context.Context, conn coreapi.Stream) {
 		if err != nil {
 			return
 		}
-		slog.Debug("dataexchange frame received",
+		slog.Debug("dataexchange frame received", append([]any{
 			"type", TypeName(frame.Type),
 			"bytes", len(frame.Payload),
-			"remote", conn.RemoteAddr())
+			"remote", conn.RemoteAddr()}, correlationAttrs(frame)...)...)
+
+		// Correlation metadata rides outside any governed envelope, so keep
+		// it to re-attach after the envelope is unwrapped below.
+		messageID, replyTo := frame.MessageID, frame.ReplyTo
+
+		// Duplicate suppression: an identical delivery of a frame that was
+		// already stored is acknowledged again but not stored twice.
+		if cache := s.dedupeCacheFor(frame); cache != nil {
+			var (
+				duplicateAck string
+				ok           bool
+			)
+			claim, duplicateAck, ok = cache.claim(ctx, deliveryKeyFor(conn.RemoteAddr(), frame))
+			if !ok {
+				return
+			}
+			if claim.cache == nil {
+				slog.Debug("dataexchange duplicate delivery suppressed", append([]any{
+					"type", TypeName(frame.Type),
+					"bytes", len(frame.Payload),
+					"remote", conn.RemoteAddr()}, correlationAttrs(frame)...)...)
+				if werr := WriteFrame(conn, &Frame{Type: TypeText, Payload: []byte(duplicateAck + duplicateAckSuffix)}); werr != nil {
+					return
+				}
+				continue
+			}
+		}
 
 		var (
 			saveErr  error
@@ -436,6 +494,7 @@ func (s *Service) handleConn(ctx context.Context, conn coreapi.Stream) {
 			} else {
 				governed = &decoded
 				frame = governed.DataFrame()
+				frame.MessageID, frame.ReplyTo = messageID, replyTo
 			}
 		} else if frame.Type == TypeGovernedFileStream {
 			decoded, governErr := DecodeGovernedStreamInit(frame)
@@ -551,7 +610,7 @@ func (s *Service) handleConn(ctx context.Context, conn coreapi.Stream) {
 						Payload: []byte(fmt.Sprintf("ERR trace parse: %v", tferr)),
 					}
 				} else {
-					innerFrame := &Frame{Type: tf.InnerType, Payload: tf.Payload}
+					innerFrame := &Frame{Type: tf.InnerType, Payload: tf.Payload, MessageID: messageID, ReplyTo: replyTo}
 					innerSaveErr := s.saveInboxMessage(innerFrame, conn.RemoteAddr())
 					inboxWrittenAtNs := time.Now().UnixNano()
 					innerAck := fmt.Sprintf("ACK %s %d bytes", TypeName(tf.InnerType), len(tf.Payload))
@@ -597,6 +656,7 @@ func (s *Service) handleConn(ctx context.Context, conn coreapi.Stream) {
 			}
 			ackFrame = &Frame{Type: TypeText, Payload: []byte(ackMsg)}
 		}
+		claim.finish(saveErr == nil, string(ackFrame.Payload))
 		if err := WriteFrame(conn, ackFrame); err != nil {
 			if s.deps.Events != nil {
 				s.deps.Events.Publish("dataexchange.ack_failed", map[string]any{
@@ -773,11 +833,13 @@ func (s *Service) prepareReceivedFile(frame *Frame, disclosure *decision.Disclos
 			return retentionErr
 		},
 		commit: func() {
-			slog.Info("file saved", "path", destPath, "bytes", len(frame.Payload))
+			slog.Info("file saved", append([]any{"path", destPath, "bytes", len(frame.Payload)}, correlationAttrs(frame)...)...)
 			if s.deps.Events != nil {
-				s.deps.Events.Publish("file.received", map[string]any{
+				event := map[string]any{
 					"filename": safeName, "size": len(frame.Payload), "path": destPath,
-				})
+				}
+				addCorrelation(event, frame)
+				s.deps.Events.Publish("file.received", event)
 			}
 		},
 	}, nil
@@ -808,6 +870,9 @@ func (s *Service) prepareInboxMessage(frame *Frame, from protocol.Addr, disclosu
 		"bytes":       len(frame.Payload),
 		"received_at": ts.Format(time.RFC3339Nano),
 	}
+	// Correlation metadata, only when the sender supplied it: a service
+	// answers a message by echoing its message_id as reply_to.
+	addCorrelation(msg, frame)
 	// Store the payload losslessly. JSON cannot represent arbitrary bytes in
 	// a string — invalid UTF-8 is replaced with U+FFFD by encoding/json — so
 	// any payload that is not valid UTF-8 (all binary frames, in practice)
@@ -881,12 +946,14 @@ func (s *Service) prepareInboxMessage(frame *Frame, from protocol.Addr, disclosu
 			return retentionErr
 		},
 		commit: func() {
-			slog.Info("inbox message saved", "path", destPath, "type", TypeName(frame.Type), "bytes", len(frame.Payload))
+			slog.Info("inbox message saved", append([]any{"path", destPath, "type", TypeName(frame.Type), "bytes", len(frame.Payload)}, correlationAttrs(frame)...)...)
 			if s.deps.Events != nil {
-				s.deps.Events.Publish("message.received", map[string]any{
+				event := map[string]any{
 					"type": TypeName(frame.Type), "from": from.String(),
 					"size": len(frame.Payload),
-				})
+				}
+				addCorrelation(event, frame)
+				s.deps.Events.Publish("message.received", event)
 			}
 			// Periodic eviction so a misbehaving peer (or sustained inbound
 			// load) cannot fill the operator's disk. We sample every
@@ -896,6 +963,31 @@ func (s *Service) prepareInboxMessage(frame *Frame, from protocol.Addr, disclosu
 			}
 		},
 	}, nil
+}
+
+// correlationAttrs returns slog attributes for a frame's MessageID / ReplyTo,
+// omitting absent ones so untagged traffic logs exactly as before.
+func correlationAttrs(frame *Frame) []any {
+	var attrs []any
+	if frame.MessageID != "" {
+		attrs = append(attrs, "message_id", frame.MessageID)
+	}
+	if frame.ReplyTo != "" {
+		attrs = append(attrs, "reply_to", frame.ReplyTo)
+	}
+	return attrs
+}
+
+// addCorrelation copies a frame's optional MessageID / ReplyTo into an inbox
+// record or event payload under the "message_id" / "reply_to" keys. Absent
+// values are omitted, so untagged traffic produces exactly the old fields.
+func addCorrelation(m map[string]any, frame *Frame) {
+	if frame.MessageID != "" {
+		m["message_id"] = frame.MessageID
+	}
+	if frame.ReplyTo != "" {
+		m["reply_to"] = frame.ReplyTo
+	}
 }
 
 // dirTotalBytes sums the on-disk size of every regular file under dir,

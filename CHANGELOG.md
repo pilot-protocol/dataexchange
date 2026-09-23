@@ -22,6 +22,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   room (as `InboxMaxBytes` was documented to do) instead of rejecting the
   new message.
 
+### Added
+
+- Optional request/reply correlation: `Frame.MessageID` and `Frame.ReplyTo`,
+  carried on the wire in a new `TypeTagged` (10) wrapper and recorded in
+  inbox JSON and `message.received` / `file.received` events as
+  `message_id` / `reply_to`. Frames without them are byte-for-byte
+  unchanged. `NewMessageID` and `ValidMessageID` helpers.
+- `Client.Send`, which waits for the ACK and, when the receiver predates
+  `TypeTagged`, re-sends the frame untagged so older peers still get it.
+- Receiver-side duplicate suppression: an identical re-delivery of a stored
+  frame that carried a `MessageID` is acknowledged (`... (duplicate)`) but
+  not stored twice (`ServiceConfig.DedupeWindow`, default 10 min).
+  `ServiceConfig.DedupeContentWindow` (off by default) extends this to
+  frames without a `MessageID`.
+
 ### Security / hardening
 
 - Lower the default per-frame cap (`DefaultMaxFrameSize`) from 1 GiB to

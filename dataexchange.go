@@ -41,6 +41,12 @@ const (
 	// TypeFileStream INIT. Subsequent chunks are accepted only while bound to
 	// that verified transfer ID on the same connection.
 	TypeGovernedFileStream uint32 = 9
+	// TypeTagged wraps another frame with optional correlation metadata
+	// (Frame.MessageID / Frame.ReplyTo). Callers never set it directly:
+	// WriteFrame emits it when either field is set and ReadFrame unwraps it,
+	// returning the inner frame with the fields populated. See tagged.go for
+	// the wire layout and the fallback rule for receivers that predate it.
+	TypeTagged uint32 = 10
 )
 
 // TraceFrame carries timing metadata around an inner message frame.
@@ -129,33 +135,67 @@ type Frame struct {
 	Type     uint32
 	Payload  []byte
 	Filename string // only for TypeFile
+
+	// MessageID optionally identifies this message so the receiver can drop
+	// an identical re-delivery and the recipient can answer it. Use
+	// NewMessageID to generate one. Empty means "no ID" (the pre-existing
+	// wire format). See tagged.go.
+	MessageID string
+	// ReplyTo optionally names the MessageID of the message this frame
+	// answers, so the original sender can match the reply to its request.
+	// Empty means "not a correlated reply".
+	ReplyTo string
 }
 
-// WriteFrame writes a frame to a writer.
+// wirePayload returns the bytes that follow the 8-byte header for f's own
+// type: the payload itself, or for TypeFile the length-prefixed filename
+// followed by the payload.
+func wirePayload(f *Frame) ([]byte, error) {
+	if f.Type != TypeFile {
+		return f.Payload, nil
+	}
+	// Prepend filename. Validate the length BEFORE the uint16 cast: a
+	// name longer than 65535 bytes would wrap the 2-byte length field
+	// and silently truncate, and any name over maxFilenameLen is
+	// rejected by ReadFrame anyway — fail fast on the writer side.
+	name := []byte(f.Filename)
+	if len(name) > maxFilenameLen {
+		return nil, fmt.Errorf("filename too long: %d bytes (max %d)", len(name), maxFilenameLen)
+	}
+	payload := make([]byte, 2+len(name)+len(f.Payload))
+	binary.BigEndian.PutUint16(payload[0:2], uint16(len(name)))
+	copy(payload[2:], name)
+	copy(payload[2+len(name):], f.Payload)
+	return payload, nil
+}
+
+// WriteFrame writes a frame to a writer. A frame with MessageID or ReplyTo
+// set is written as a TypeTagged wrapper around its own type; receivers that
+// predate TypeTagged reject it, so prefer Client.Send, which falls back to
+// the untagged form for them.
 func WriteFrame(w io.Writer, f *Frame) error {
-	payload := f.Payload
-	if f.Type == TypeFile {
-		// Prepend filename. Validate the length BEFORE the uint16 cast: a
-		// name longer than 65535 bytes would wrap the 2-byte length field
-		// and silently truncate, and any name over maxFilenameLen is
-		// rejected by ReadFrame anyway — fail fast on the writer side.
-		name := []byte(f.Filename)
-		if len(name) > maxFilenameLen {
-			return fmt.Errorf("filename too long: %d bytes (max %d)", len(name), maxFilenameLen)
-		}
-		payload = make([]byte, 2+len(name)+len(f.Payload))
-		binary.BigEndian.PutUint16(payload[0:2], uint16(len(name)))
-		copy(payload[2:], name)
-		copy(payload[2+len(name):], f.Payload)
+	ftype := f.Type
+	var (
+		payload []byte
+		err     error
+	)
+	if f.MessageID != "" || f.ReplyTo != "" {
+		payload, err = taggedWirePayload(f)
+		ftype = TypeTagged
+	} else {
+		payload, err = wirePayload(f)
+	}
+	if err != nil {
+		return err
 	}
 
 	var hdr [8]byte
-	binary.BigEndian.PutUint32(hdr[0:4], f.Type)
+	binary.BigEndian.PutUint32(hdr[0:4], ftype)
 	binary.BigEndian.PutUint32(hdr[4:8], uint32(len(payload)))
 	if _, err := w.Write(hdr[:]); err != nil {
 		return err
 	}
-	_, err := w.Write(payload)
+	_, err = w.Write(payload)
 	return err
 }
 
@@ -183,6 +223,24 @@ func ReadFrame(r io.Reader) (*Frame, error) {
 		return nil, err
 	}
 
+	if ftype == TypeTagged {
+		meta, innerType, inner, err := decodeTaggedPayload(payload)
+		if err != nil {
+			return nil, err
+		}
+		f, err := parseFramePayload(innerType, inner)
+		if err != nil {
+			return nil, err
+		}
+		f.MessageID, f.ReplyTo = meta.MessageID, meta.ReplyTo
+		return f, nil
+	}
+	return parseFramePayload(ftype, payload)
+}
+
+// parseFramePayload builds a Frame from a type and the bytes that followed
+// its header, splitting off and validating the TypeFile filename prefix.
+func parseFramePayload(ftype uint32, payload []byte) (*Frame, error) {
 	f := &Frame{Type: ftype, Payload: payload}
 
 	if ftype == TypeFile && len(payload) >= 2 {
@@ -265,6 +323,8 @@ func TypeName(t uint32) string {
 		return "GOVERNED"
 	case TypeGovernedFileStream:
 		return "GOVERNED_FILESTREAM"
+	case TypeTagged:
+		return "TAGGED"
 	default:
 		return fmt.Sprintf("UNKNOWN(%d)", t)
 	}
