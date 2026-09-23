@@ -181,6 +181,9 @@ type Service struct {
 	// without one. See dedupe.go.
 	dedupeByID      *deliveryDedupe
 	dedupeByContent *deliveryDedupe
+	// afterInboxWrite, when set (tests only), runs right after an inbox
+	// message's file is written, while its byte reservation is still open.
+	afterInboxWrite func(path string)
 }
 
 // persistedDelivery separates a disk write from its visible notification so a
@@ -893,12 +896,18 @@ func (s *Service) prepareInboxMessage(frame *Frame, from protocol.Addr, disclosu
 	}
 	size := int64(len(data))
 
+	seq := s.seq.Add(1)
+	filename := fmt.Sprintf("%s-%s-%06d.json", TypeName(frame.Type), ts.Format("20060102-150405.000"), seq)
+	destPath := filepath.Join(dir, filename)
+
 	// Byte budget: admit the exact file size BEFORE writing, evicting the
 	// oldest messages if needed. The cap is always on (defaulted) unless the
-	// operator explicitly disables it with a negative config value.
+	// operator explicitly disables it with a negative config value. Until
+	// inboxWriteDone settles it, the reservation also keeps destPath from
+	// being evicted by a concurrent writer.
 	maxBytes := s.effectiveInboxMaxBytes()
 	if maxBytes > 0 {
-		if err := s.reserveInbox(dir, size, maxBytes); err != nil {
+		if err := s.reserveInbox(dir, destPath, size, maxBytes); err != nil {
 			slog.Warn("inbox byte budget exceeded",
 				"max_bytes", maxBytes,
 				"message_bytes", size,
@@ -917,13 +926,10 @@ func (s *Service) prepareInboxMessage(frame *Frame, from protocol.Addr, disclosu
 	written := false
 	defer func() {
 		if maxBytes > 0 {
-			s.inboxWriteDone(size, written)
+			s.inboxWriteDone(destPath, size, written)
 		}
 	}()
 
-	seq := s.seq.Add(1)
-	filename := fmt.Sprintf("%s-%s-%06d.json", TypeName(frame.Type), ts.Format("20060102-150405.000"), seq)
-	destPath := filepath.Join(dir, filename)
 	retention, err := s.prepareGovernedRetention(disclosure, destPath)
 	if err != nil {
 		return persistedDelivery{}, err
@@ -933,6 +939,9 @@ func (s *Service) prepareInboxMessage(frame *Frame, from protocol.Addr, disclosu
 		return persistedDelivery{}, fmt.Errorf("write: %w", err)
 	}
 	written = true
+	if s.afterInboxWrite != nil {
+		s.afterInboxWrite(destPath)
+	}
 	return persistedDelivery{
 		rollback: func() error {
 			removeErr := os.Remove(destPath)

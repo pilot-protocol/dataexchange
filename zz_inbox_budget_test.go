@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -340,14 +341,178 @@ func TestInboxByteCap_UnlistableInboxIsBestEffort(t *testing.T) {
 	t.Parallel()
 	s := NewService(ServiceConfig{InboxMaxBytes: 1 << 20})
 	missing := filepath.Join(t.TempDir(), "does-not-exist")
-	if err := s.reserveInbox(missing, 100, 1<<20); err != nil {
+	path := filepath.Join(missing, "TEXT-x.json")
+	if err := s.reserveInbox(missing, path, 100, 1<<20); err != nil {
 		t.Fatalf("reserve with an unlistable inbox: %v", err)
 	}
 	if s.inbox.pending != 100 {
 		t.Fatalf("pending = %d, want 100", s.inbox.pending)
 	}
-	s.inboxWriteDone(100, false)
-	if s.inbox.pending != 0 || s.inbox.onDisk != 0 {
-		t.Fatalf("after a failed write pending=%d onDisk=%d, want 0/0", s.inbox.pending, s.inbox.onDisk)
+	s.inboxWriteDone(path, 100, false)
+	if s.inbox.pending != 0 || s.inbox.onDisk != 0 || len(s.inbox.inflight) != 0 {
+		t.Fatalf("after a failed write pending=%d onDisk=%d inflight=%d, want 0/0/0", s.inbox.pending, s.inbox.onDisk, len(s.inbox.inflight))
+	}
+}
+
+// fileWithMarker reports whether some file in dir contains marker.
+func fileWithMarker(t *testing.T, dir, marker string) bool {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range entries {
+		raw, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err == nil && strings.Contains(string(raw), marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestInboxByteCap_InflightWriteNotEvicted is the regression test for review
+// finding DX-REV-2. Writer A is admitted and its file is fully written, but
+// its reservation is not settled yet (the window between os.WriteFile and
+// the deferred inboxWriteDone). Writer B then needs an eviction. B used to
+// count A's bytes twice (in the fresh scan and in pending), evict down past
+// the old file and delete A's file too, although A had been admitted and
+// was about to be ACKed, and A + B fit under the cap.
+func TestInboxByteCap_InflightWriteNotEvicted(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	const capBytes = 1000
+	s := NewService(ServiceConfig{InboxDir: tmp, InboxMaxBytes: capBytes})
+	oldPath := filepath.Join(tmp, "OLD.json")
+	if err := os.WriteFile(oldPath, []byte(strings.Repeat("o", 300)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	mt := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(oldPath, mt, mt); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold writer A right after its file is on disk.
+	aWritten := make(chan string, 1)
+	releaseA := make(chan struct{})
+	release := sync.OnceFunc(func() { close(releaseA) })
+	defer release()
+	var writes atomic.Int32
+	s.afterInboxWrite = func(path string) {
+		if writes.Add(1) == 1 { // writer A only
+			aWritten <- path
+			<-releaseA
+		}
+	}
+	from := protocol.Addr{Network: 1, Node: 0x2}
+	errA := make(chan error, 1)
+	go func() {
+		errA <- s.saveInboxMessage(&Frame{Type: TypeText, Payload: []byte("MARKER-A" + strings.Repeat("a", 292))}, from)
+	}()
+	aPath := <-aWritten
+
+	if err := s.saveInboxMessage(&Frame{Type: TypeText, Payload: []byte("MARKER-B" + strings.Repeat("b", 292))}, from); err != nil {
+		t.Fatalf("save B: %v", err)
+	}
+	if _, err := os.Stat(aPath); err != nil {
+		t.Fatalf("B's eviction deleted A's file, which was admitted and fully written: %v", err)
+	}
+	release()
+	if err := <-errA; err != nil {
+		t.Fatalf("save A: %v", err)
+	}
+
+	aInfo, err := os.Stat(aPath)
+	if err != nil {
+		t.Fatalf("A's file is gone after A was acknowledged: %v", err)
+	}
+	total, err := inboxTotalBytes(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bSize := total - aInfo.Size()
+	if _, err := os.Stat(oldPath); err == nil {
+		bSize -= 300
+	}
+	// The premise: OLD + A + B does not fit, A + B fits under the low-water
+	// mark, so exactly OLD has to go.
+	if 300+aInfo.Size()+bSize <= capBytes || aInfo.Size()+bSize > inboxLowWater(capBytes) {
+		t.Fatalf("test premise broken: A=%d B=%d bytes", aInfo.Size(), bSize)
+	}
+	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+		t.Fatalf("the oldest message was not evicted to make room (stat err %v)", err)
+	}
+	if !fileWithMarker(t, tmp, "MARKER-A") || !fileWithMarker(t, tmp, "MARKER-B") {
+		t.Fatal("A or B missing from the inbox")
+	}
+	if total > capBytes {
+		t.Fatalf("inbox holds %d bytes, over the %d cap", total, capBytes)
+	}
+	// The running total counts each file once.
+	if s.inbox.pending != 0 || s.inbox.onDisk != total || len(s.inbox.inflight) != 0 {
+		t.Fatalf("budget pending=%d onDisk=%d inflight=%d, want 0/%d/0", s.inbox.pending, s.inbox.onDisk, len(s.inbox.inflight), total)
+	}
+}
+
+// TestInboxByteCap_RescanDoesNotDoubleCountInflight: a rescan while a write
+// is in flight must not add the in-flight file to onDisk, or the running
+// total overstates the inbox once the write settles.
+func TestInboxByteCap_RescanDoesNotDoubleCountInflight(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	s := NewService(ServiceConfig{InboxDir: tmp, InboxMaxBytes: 1 << 20})
+	path := filepath.Join(tmp, "TEXT-inflight.json")
+	if err := s.reserveInbox(tmp, path, 400, 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, make([]byte, 400), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s.evictInboxOverflow(tmp) // rescans while the write is in flight
+	if s.inbox.onDisk != 0 {
+		t.Fatalf("onDisk = %d while the only file is in flight, want 0", s.inbox.onDisk)
+	}
+	s.inboxWriteDone(path, 400, true)
+	if s.inbox.onDisk != 400 || s.inbox.pending != 0 {
+		t.Fatalf("after settling onDisk=%d pending=%d, want 400/0", s.inbox.onDisk, s.inbox.pending)
+	}
+}
+
+// TestEvictInboxOverflow_SkipsInflightWrite: the periodic pass must not
+// delete a file whose write is in flight either. It trims the settled files
+// so that they fit next to the in-flight bytes.
+func TestEvictInboxOverflow_SkipsInflightWrite(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	const capBytes = 1000
+	s := NewService(ServiceConfig{InboxDir: tmp, InboxMaxBytes: capBytes})
+	path := filepath.Join(tmp, "TEXT-inflight.json")
+	if err := s.reserveInbox(tmp, path, 950, capBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, make([]byte, 950), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Another process drops a file in while the write is in flight, and the
+	// in-flight file is (for this test) older than it.
+	other := filepath.Join(tmp, "OTHER.json")
+	if err := os.WriteFile(other, make([]byte, 100), 0600); err != nil {
+		t.Fatal(err)
+	}
+	older := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(path, older, older); err != nil {
+		t.Fatal(err)
+	}
+
+	s.evictInboxOverflow(tmp)
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("periodic eviction deleted an in-flight write: %v", err)
+	}
+	if _, err := os.Stat(other); !os.IsNotExist(err) {
+		t.Fatalf("settled file not trimmed although settled + in-flight is over the cap (stat err %v)", err)
+	}
+	s.inboxWriteDone(path, 950, true)
+	if total, _ := inboxTotalBytes(tmp); s.inbox.onDisk != total || total > capBytes {
+		t.Fatalf("onDisk=%d disk=%d cap=%d", s.inbox.onDisk, total, capBytes)
 	}
 }

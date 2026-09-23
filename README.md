@@ -76,7 +76,8 @@ Two caps bound the inbox, and both evict the **oldest** messages first:
   against a running byte total (no directory scan per message). When a new
   message would not fit, the oldest messages are removed until the inbox plus
   the new message is at or below 90% of the cap, so recent replies survive
-  and the next messages do not each trigger another eviction. A single
+  and the next messages do not each trigger another eviction. A message
+  that another connection is still writing is never evicted. A single
   message larger than the cap is rejected without evicting anything. A
   negative value disables the byte cap.
 

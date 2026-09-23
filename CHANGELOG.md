@@ -17,7 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   use the effective cap, evict oldest-first down to 90% of it, and never
   evict for a message that cannot fit at all.
 - The byte cap is checked against a running total instead of listing and
-  stat'ing the whole inbox on every incoming message.
+  stat'ing the whole inbox on every incoming message. A message that another
+  connection is still writing (admitted, but not yet acknowledged) is never
+  evicted and never counted twice.
 - When the byte cap is full the inbox now evicts the oldest messages to make
   room (as `InboxMaxBytes` was documented to do) instead of rejecting the
   new message.

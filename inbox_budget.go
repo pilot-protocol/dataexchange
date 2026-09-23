@@ -32,6 +32,13 @@ import (
 // the inbox plus the incoming message fits in inboxLowWaterPercent of the
 // cap, so one eviction pass makes room for many following messages instead
 // of running again on every write.
+//
+// A write is in flight from its reservation until inboxWriteDone. Its bytes
+// are counted in pending the whole time, but its file can already be on
+// disk, fully or partly written, when another writer rescans. Rescans
+// therefore leave in-flight files out: their bytes are not added to onDisk
+// a second time, and eviction never deletes a message that has been
+// admitted and is about to be acknowledged.
 
 // inboxLowWaterPercent is the fill level, as a percentage of the byte cap,
 // that a byte-cap eviction trims the inbox down to.
@@ -46,11 +53,15 @@ type inboxBudget struct {
 	dir string
 	// known is false until the first scan of dir.
 	known bool
-	// onDisk is the byte total of the inbox files as of the last scan, plus
-	// files this service wrote since, minus files it removed since.
+	// onDisk is the byte total of the settled inbox files (all but the
+	// in-flight ones) as of the last scan, plus files this service wrote
+	// since, minus files it removed since.
 	onDisk int64
 	// pending is bytes admitted for writes that have not finished yet.
 	pending int64
+	// inflight holds the destination path of every write counted in
+	// pending. rescanLocked skips these files.
+	inflight map[string]struct{}
 	// scans counts directory listings, so tests can check that the byte cap
 	// is not paid for with a full scan per message.
 	scans int
@@ -112,21 +123,46 @@ func removeOldestInbox(dir string, files []inboxFile, total, limit int64) (int64
 	return total, evicted
 }
 
-// rescanLocked re-reads dir and resets the running total. b.mu must be held.
+// rescanLocked re-reads dir and resets the running total. Files of writes
+// still in flight are left out of both the returned list and the total:
+// their bytes are already in pending, and they must not be evicted. b.mu
+// must be held.
 func (b *inboxBudget) rescanLocked(dir string) ([]inboxFile, error) {
 	b.scans++
 	files, total, err := scanInbox(dir)
 	if err != nil {
 		return nil, err
 	}
+	if len(b.inflight) > 0 {
+		settled := files[:0]
+		for _, f := range files {
+			if _, busy := b.inflight[filepath.Join(dir, f.name)]; busy {
+				total -= f.size
+				continue
+			}
+			settled = append(settled, f)
+		}
+		files = settled
+	}
 	b.dir, b.known, b.onDisk = dir, true, total
 	return files, nil
 }
 
-// reserveInbox admits a message of size bytes under the byte cap maxBytes
-// (> 0), evicting the oldest messages when needed. On success the caller
-// must report the write's outcome with inboxWriteDone.
-func (s *Service) reserveInbox(dir string, size, maxBytes int64) error {
+// admitLocked records a reservation of size bytes for the file at path.
+// b.mu must be held.
+func (b *inboxBudget) admitLocked(path string, size int64) {
+	b.pending += size
+	if b.inflight == nil {
+		b.inflight = make(map[string]struct{})
+	}
+	b.inflight[path] = struct{}{}
+}
+
+// reserveInbox admits a message of size bytes, to be written to path inside
+// dir, under the byte cap maxBytes (> 0), evicting the oldest messages when
+// needed. On success the caller must report the write's outcome with
+// inboxWriteDone(path, ...).
+func (s *Service) reserveInbox(dir, path string, size, maxBytes int64) error {
 	b := &s.inbox
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -143,7 +179,7 @@ func (s *Service) reserveInbox(dir string, size, maxBytes int64) error {
 			// Best-effort, as before: an unlistable inbox does not block
 			// delivery; the write itself reports any real I/O problem.
 			slog.Warn("inbox byte budget: cannot list inbox; admitting message unchecked", "dir", dir, "err", err)
-			b.pending += size
+			b.admitLocked(path, size)
 			return nil
 		}
 	}
@@ -153,7 +189,7 @@ func (s *Service) reserveInbox(dir string, size, maxBytes int64) error {
 		files, err := b.rescanLocked(dir)
 		if err != nil {
 			slog.Warn("inbox byte budget: cannot list inbox; admitting message unchecked", "dir", dir, "err", err)
-			b.pending += size
+			b.admitLocked(path, size)
 			return nil
 		}
 		if b.onDisk+b.pending+size > maxBytes {
@@ -171,15 +207,17 @@ func (s *Service) reserveInbox(dir string, size, maxBytes int64) error {
 			return fmt.Errorf("inbox byte budget exceeded: %d + %d > %d", b.onDisk+b.pending, size, maxBytes)
 		}
 	}
-	b.pending += size
+	b.admitLocked(path, size)
 	return nil
 }
 
-// inboxWriteDone settles a reservation made by reserveInbox.
-func (s *Service) inboxWriteDone(size int64, written bool) {
+// inboxWriteDone settles the reservation reserveInbox made for path. From
+// then on the file counts in onDisk (if it was written) and can be evicted.
+func (s *Service) inboxWriteDone(path string, size int64, written bool) {
 	b := &s.inbox
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	delete(b.inflight, path)
 	b.pending -= size
 	if b.pending < 0 {
 		b.pending = 0
@@ -203,8 +241,9 @@ func (s *Service) inboxFileRemoved(size int64) {
 // evictInboxOverflow enforces both inbox caps from a fresh listing: the file
 // count (InboxMaxFiles, default 10000) and the byte total
 // (effectiveInboxMaxBytes, trimmed to the low-water mark when exceeded). It
-// also re-seeds the running byte total. Best-effort: I/O errors are logged
-// and skipped. Called periodically from saveInboxMessage.
+// also re-seeds the running byte total. Files of writes still in flight are
+// never evicted (see rescanLocked). Best-effort: I/O errors are logged and
+// skipped. Called periodically from saveInboxMessage.
 func (s *Service) evictInboxOverflow(dir string) {
 	b := &s.inbox
 	b.mu.Lock()
@@ -233,10 +272,18 @@ func (s *Service) evictInboxOverflow(dir string) {
 		files = files[toEvict:]
 		slog.Info("inbox eviction", "dir", dir, "evicted", evicted, "remaining", len(files))
 	}
-	if maxBytes := s.effectiveInboxMaxBytes(); maxBytes > 0 && b.onDisk > maxBytes {
+	if maxBytes := s.effectiveInboxMaxBytes(); maxBytes > 0 && b.onDisk+b.pending > maxBytes {
+		// Writes still in flight were admitted under the cap and are not
+		// candidates, so trim the settled files until they fit next to them:
+		// down to the low-water mark, or to the cap when the in-flight
+		// writes alone are above the low-water mark (as in reserveInbox).
+		target := inboxLowWater(maxBytes)
+		if b.pending > target {
+			target = maxBytes
+		}
 		before := b.onDisk
 		var evicted int
-		b.onDisk, evicted = removeOldestInbox(dir, files, b.onDisk, inboxLowWater(maxBytes))
+		b.onDisk, evicted = removeOldestInbox(dir, files, b.onDisk, target-b.pending)
 		slog.Info("inbox eviction (bytes)", "dir", dir, "evicted", evicted,
 			"bytes_before", before, "bytes_after", b.onDisk, "max_bytes", maxBytes)
 	}
