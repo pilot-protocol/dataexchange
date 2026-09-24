@@ -1,4 +1,4 @@
-github.com/pilot-protocol/common v0.5.14 h1:CKLjgRimNlksUe0OePHkOE32aPlemjfdRMBq8X/CDiw=
-github.com/pilot-protocol/common v0.5.14/go.mod h1:OTXD84ScrBbKTAhawgFlLw9HtisgNvr83Zs1yDAuG9k=
+github.com/pilot-protocol/common v0.5.15 h1:ds6DNWlth97pMcXZ7fMgfy9/s553la3/YuYOkwoXjjE=
+github.com/pilot-protocol/common v0.5.15/go.mod h1:OTXD84ScrBbKTAhawgFlLw9HtisgNvr83Zs1yDAuG9k=
 github.com/pilot-protocol/eventstream v0.2.4 h1:SyB64wqo+Qpz0hIAuzHGkI9Npwk5SFSg1aqNFLueUIQ=
 github.com/pilot-protocol/eventstream v0.2.4/go.mod h1:ccBhrLd2vUj70bStS/FJHg7DhjeZ0jinOls6Et4U5cg=
