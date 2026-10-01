@@ -30,6 +30,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Several transfers of the same content at once no longer fail. The receiver
+  names a transfer's `.partial` after the content hash so a retry can resume
+  it; two peers sending the same file (or one sender on two connections)
+  therefore wrote the same file, and all but the first failed at the final
+  rename. The first transfer keeps the resumable `.partial`; a concurrent one
+  gets a private file that is removed if it does not finish.
+- A file that cannot fit on the receiver's disk is refused before any byte is
+  sent. The byte quota is a fixed number and can be larger than the disk, so a
+  transfer ran until the disk was full, failed, and left its bytes in
+  `.partial` — where they kept the disk full and blocked incoming messages.
+  The receiver now checks free space at the start (keeping 16 MiB in reserve),
+  and if a write still hits a full disk it deletes that `.partial`.
+- A sender whose transfer is refused at the start (quota, disk full, too many
+  transfers) reports the refusal. It was mistaken for a receiver too old to
+  support streamed transfers, so the caller retried with the single-frame
+  path and pushed the whole file at a peer that had just declined it.
+- `WriteFrame` sends a frame of up to 64 KiB as one write. Header and payload
+  as two writes made the payload wait on Nagle and the peer's delayed ACK.
 - The inbox byte cap no longer deletes the whole inbox. With the default
   config (`InboxMaxBytes == 0`, meaning 256 MiB) the evictor compared the
   inbox size against the raw value 0, so the first time the inbox passed
