@@ -280,13 +280,13 @@ func TestInboxByteCap_ConcurrentWritersHoldCap(t *testing.T) {
 	}
 }
 
-// TestInboxByteCap_RollbackReleasesBytes: a governed delivery that is
-// rolled back (receipt failure) must hand its bytes back to the budget.
+// TestInboxByteCap_RollbackReleasesBytes: a staged delivery that is rolled
+// back must hand its bytes back to the budget.
 func TestInboxByteCap_RollbackReleasesBytes(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
 	s := NewService(ServiceConfig{InboxDir: tmp, InboxMaxBytes: 1 << 20})
-	delivery, err := s.prepareInboxMessage(&Frame{Type: TypeText, Payload: []byte("to be rolled back")}, protocol.Addr{Node: 3}, nil)
+	delivery, err := s.prepareInboxMessage(&Frame{Type: TypeText, Payload: []byte("to be rolled back")}, protocol.Addr{Node: 3})
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}

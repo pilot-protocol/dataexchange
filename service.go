@@ -6,7 +6,6 @@
 package dataexchange
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -19,7 +18,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/pilot-protocol/common/coreapi"
-	"github.com/pilot-protocol/common/decision"
 	"github.com/pilot-protocol/common/protocol"
 )
 
@@ -72,31 +70,6 @@ type ServiceConfig struct {
 	// instead of pinning the goroutine and its buffers indefinitely.
 	// Zero ⇒ DefaultIdleTimeout; a negative value disables the deadline.
 	IdleTimeout time.Duration
-	// RequireGoverned rejects legacy frames unless they carry a signed
-	// governed envelope verified by GovernedVerifier. Enable this only after
-	// sender rollout; the default preserves compatibility with older peers.
-	RequireGoverned         bool
-	GovernedVerifier        GovernedFrameVerifier
-	GovernedStreamVerifier  GovernedStreamVerifier
-	RequireGovernedReceipts bool
-	GovernedReceiptRecorder GovernedReceiptRecorder
-	// GovernedContentInspector runs only at this receiver, after signed
-	// governed verification and before a message/file is released. It receives
-	// a reader, not an exported payload copy, so central authority services do
-	// not need application plaintext for DLP.
-	GovernedContentInspector         decision.DisclosureContentInspector
-	RequireGovernedContentInspection bool
-	// GovernedTransferQuota bounds admitted transfers for each verified
-	// Intent.AgentID. It never uses an untrusted peer address as the subject.
-	// Quota is charged at governed-frame verification (or stream INIT) and does
-	// not silently apply to legacy traffic.
-	GovernedTransferQuota *decision.TransferQuotaLimiter
-	// GovernedRetentionPolicies maps signed V2 disclosure retention classes to
-	// durable local expiry work. When non-empty, governed deliveries without a
-	// configured V2 retention class are rejected before persistence.
-	GovernedRetentionPolicies []GovernedRetentionPolicy
-	RetentionStateDir         string
-	RetentionSweepInterval    time.Duration
 }
 
 // Defensible defaults applied when the corresponding ServiceConfig field
@@ -167,15 +140,13 @@ const inboxEvictCheckEvery = 64
 // Service is the L11 plugin adapter. Daemon (L7) holds it only as
 // coreapi.Service; cmd/daemon/main.go (L12) constructs it.
 type Service struct {
-	cfg       ServiceConfig
-	listener  coreapi.Listener
-	deps      coreapi.Deps
-	cancel    context.CancelFunc
-	done      chan struct{}
-	seq       atomic.Uint64
-	retention *governedRetentionManager
-	replay    *governedReplayGuard
-	inbox     inboxBudget
+	cfg      ServiceConfig
+	listener coreapi.Listener
+	deps     coreapi.Deps
+	cancel   context.CancelFunc
+	done     chan struct{}
+	seq      atomic.Uint64
+	inbox    inboxBudget
 	// dedupeByID remembers stored frames that carried a MessageID;
 	// dedupeByContent (nil unless DedupeContentWindow > 0) remembers frames
 	// without one. See dedupe.go.
@@ -186,17 +157,15 @@ type Service struct {
 	afterInboxWrite func(path string)
 }
 
-// persistedDelivery separates a disk write from its visible notification so a
-// governed receipt can be durably appended before the receiver acknowledges
-// or publishes the delivery event. A failed receipt causes the staged file to
-// be removed rather than leaving an unreceipted enterprise side effect.
+// persistedDelivery separates a disk write from its visible notification:
+// commit logs and publishes the delivery, rollback removes the staged file.
 type persistedDelivery struct {
 	rollback func() error
 	commit   func()
 }
 
 func NewService(cfg ServiceConfig) *Service {
-	s := &Service{cfg: cfg, replay: newGovernedReplayGuard()}
+	s := &Service{cfg: cfg}
 	if window := s.effectiveDedupeWindow(); window > 0 {
 		s.dedupeByID = newDeliveryDedupe(window, dedupeMaxEntries)
 	}
@@ -212,13 +181,7 @@ func (s *Service) Name() string { return "dataexchange" }
 func (s *Service) Order() int { return 110 }
 
 func (s *Service) Start(ctx context.Context, deps coreapi.Deps) error {
-	if err := s.validateGovernedConfig(); err != nil {
-		return err
-	}
 	s.deps = deps
-	if err := s.initializeGovernedRetention(); err != nil {
-		return err
-	}
 	ln, err := deps.Streams.Listen(protocol.PortDataExchange)
 	if err != nil {
 		return fmt.Errorf("dataexchange: listen on port %d: %w", protocol.PortDataExchange, err)
@@ -229,75 +192,8 @@ func (s *Service) Start(ctx context.Context, deps coreapi.Deps) error {
 	s.cancel = cancel
 	s.done = make(chan struct{})
 	go s.acceptLoop(runCtx)
-	if s.retention != nil {
-		go s.retention.run(runCtx.Done(), s.cfg.RetentionSweepInterval)
-	}
 	slog.Info("dataexchange service listening", "port", protocol.PortDataExchange)
 	return nil
-}
-
-func (s *Service) validateGovernedConfig() error {
-	if s.cfg.RequireGovernedReceipts && (!s.cfg.RequireGoverned || s.cfg.GovernedReceiptRecorder == nil) {
-		return fmt.Errorf("dataexchange: governed receipts require a governed receiver and receipt recorder")
-	}
-	if s.cfg.RequireGovernedContentInspection && (!s.cfg.RequireGoverned || s.cfg.GovernedContentInspector == nil) {
-		return fmt.Errorf("dataexchange: required content inspection needs a governed receiver and local inspector")
-	}
-	if s.cfg.GovernedTransferQuota != nil && !s.cfg.RequireGoverned {
-		return fmt.Errorf("dataexchange: governed transfer quota requires a governed receiver")
-	}
-	if len(s.cfg.GovernedRetentionPolicies) > 0 && !s.cfg.RequireGoverned {
-		return fmt.Errorf("dataexchange: governed retention requires a governed receiver")
-	}
-	return nil
-}
-
-func (s *Service) initializeGovernedRetention() error {
-	if len(s.cfg.GovernedRetentionPolicies) == 0 {
-		s.retention = nil
-		return nil
-	}
-	inbox, err := s.inboxDir()
-	if err != nil {
-		return fmt.Errorf("dataexchange: retention inbox directory: %w", err)
-	}
-	received, err := s.receivedDir()
-	if err != nil {
-		return fmt.Errorf("dataexchange: retention received directory: %w", err)
-	}
-	stateDir := s.cfg.RetentionStateDir
-	if stateDir == "" {
-		stateDir = filepath.Join(filepath.Dir(inbox), "retention")
-	}
-	manager, err := newGovernedRetentionManager(stateDir, map[string]string{"inbox": inbox, "received": received}, s.cfg.GovernedRetentionPolicies, nil)
-	if err != nil {
-		return err
-	}
-	if err := manager.Sweep(); err != nil {
-		return err
-	}
-	s.retention = manager
-	return nil
-}
-
-func (s *Service) requireGovernedRetention(disclosure *decision.DisclosureBinding) error {
-	if s.retention == nil {
-		return nil
-	}
-	if disclosure == nil || disclosure.Version != decision.DisclosureBindingRetentionVersion || disclosure.RetentionClass == "" {
-		return fmt.Errorf("dataexchange: governed retention requires a V2 disclosure retention class")
-	}
-	if _, exists := s.retention.policies[disclosure.RetentionClass]; !exists {
-		return fmt.Errorf("dataexchange: disclosure retention class is not configured")
-	}
-	return nil
-}
-
-func (s *Service) prepareGovernedRetention(disclosure *decision.DisclosureBinding, path string) (retentionTicket, error) {
-	if s.retention == nil {
-		return retentionTicket{}, nil
-	}
-	return s.retention.prepare(disclosure, path)
 }
 
 func (s *Service) Stop(ctx context.Context) error {
@@ -352,17 +248,12 @@ func (s *Service) handleConn(ctx context.Context, conn coreapi.Stream) {
 	// Final filenames and the file.received event match saveReceivedFile so
 	// the two transfer paths are indistinguishable to consumers.
 	var sr *StreamReceiver
-	governedStreams := make(map[[transferIDLen]byte]GovernedStreamInit)
-	streamRetention := make(map[[transferIDLen]byte]retentionTicket)
 	// claim is the dedupe claim for the frame being processed. If handling
 	// unwinds early (a panic), releasing it as "not stored" lets any
 	// identical delivery waiting on it proceed instead of hanging.
 	var claim dedupeClaim
 	defer func() {
 		claim.finish(false, "")
-		for _, ticket := range streamRetention {
-			_ = ticket.rollback()
-		}
 		if sr != nil {
 			sr.Close()
 		}
@@ -382,55 +273,6 @@ func (s *Service) handleConn(ctx context.Context, conn coreapi.Stream) {
 			})
 		}
 	}
-	streamOnPrepare := func(id [transferIDLen]byte, _ string, path string, _ int64) error {
-		governed, governedTransfer := governedStreams[id]
-		if s.cfg.RequireGoverned && !governedTransfer {
-			return fmt.Errorf("stream completion is not bound to a governed INIT")
-		}
-		if !governedTransfer {
-			return nil
-		}
-		ticket, err := s.prepareGovernedRetention(governed.Disclosure, path)
-		if err != nil {
-			return err
-		}
-		streamRetention[id] = ticket
-		return nil
-	}
-	streamOnCommit := func(id [transferIDLen]byte, name, path string, _ int64) error {
-		governed, governedTransfer := governedStreams[id]
-		if s.cfg.RequireGoverned && !governedTransfer {
-			return fmt.Errorf("stream completion is not bound to a governed INIT")
-		}
-		if !governedTransfer {
-			return nil
-		}
-		defer delete(governedStreams, id)
-		retention := streamRetention[id]
-		defer delete(streamRetention, id)
-		committed := false
-		defer func() {
-			if !committed {
-				_ = retention.rollback()
-			}
-		}()
-		if err := s.inspectGovernedStreamFile(ctx, governed, path, name); err != nil {
-			return err
-		}
-		if s.cfg.GovernedReceiptRecorder == nil {
-			if s.cfg.RequireGovernedReceipts {
-				return fmt.Errorf("governed receipt recorder is not configured")
-			}
-			committed = true
-			return nil
-		}
-		if err := recordGovernedReceipt(ctx, s.cfg.GovernedReceiptRecorder, governed.Intent, governed.Decision, governed.Disclosure); err != nil {
-			return fmt.Errorf("record governed stream receipt: %w", err)
-		}
-		committed = true
-		return nil
-	}
-
 	idle := s.effectiveIdleTimeout()
 	dl, canDeadline := conn.(readDeadliner)
 	for {
@@ -452,8 +294,7 @@ func (s *Service) handleConn(ctx context.Context, conn coreapi.Stream) {
 			"bytes", len(frame.Payload),
 			"remote", conn.RemoteAddr()}, correlationAttrs(frame)...)...)
 
-		// Correlation metadata rides outside any governed envelope, so keep
-		// it to re-attach after the envelope is unwrapped below.
+		// Correlation metadata, re-attached to a trace frame's inner message.
 		messageID, replyTo := frame.MessageID, frame.ReplyTo
 
 		// Duplicate suppression: an identical delivery of a frame that was
@@ -482,176 +323,71 @@ func (s *Service) handleConn(ctx context.Context, conn coreapi.Stream) {
 		var (
 			saveErr  error
 			ackFrame *Frame
-			governed *GovernedFrame
-			streamed *GovernedStreamInit
-			delivery persistedDelivery
 		)
-		if frame.Type == TypeGoverned {
-			decoded, governErr := DecodeGovernedFrame(frame)
-			if governErr != nil {
-				saveErr = governErr
-			} else if s.cfg.GovernedVerifier == nil {
-				saveErr = fmt.Errorf("governed frame received but no verifier is configured")
-			} else if governErr = s.cfg.GovernedVerifier.VerifyGovernedFrame(ctx, conn.RemoteAddr(), decoded); governErr != nil {
-				saveErr = governErr
-			} else {
-				governed = &decoded
-				frame = governed.DataFrame()
-				frame.MessageID, frame.ReplyTo = messageID, replyTo
+		switch frame.Type {
+		case TypeFileStream:
+			// Chunked/resumable transfer. The receiver emits its own
+			// control responses (INIT-ACK / ACK / COMPLETE), so skip the
+			// generic per-frame ACK below.
+			if sr == nil {
+				dir, derr := s.receivedDir()
+				if derr != nil {
+					_ = WriteFrame(conn, &Frame{Type: TypeText, Payload: []byte("ERR received dir: " + derr.Error())})
+					return
+				}
+				if mderr := os.MkdirAll(dir, 0700); mderr != nil {
+					_ = WriteFrame(conn, &Frame{Type: TypeText, Payload: []byte("ERR mkdir: " + mderr.Error())})
+					return
+				}
+				sr = NewStreamReceiverWithQuota(dir, streamNameSuffix, streamOnSaved, s.effectiveReceivedMaxBytes())
 			}
-		} else if frame.Type == TypeGovernedFileStream {
-			decoded, governErr := DecodeGovernedStreamInit(frame)
-			if governErr != nil {
-				saveErr = governErr
-			} else if s.cfg.GovernedStreamVerifier == nil {
-				saveErr = fmt.Errorf("governed stream received but no verifier is configured")
-			} else if governErr = s.cfg.GovernedStreamVerifier.VerifyGovernedStreamInit(ctx, conn.RemoteAddr(), decoded); governErr != nil {
-				saveErr = governErr
-			} else {
-				streamed = &decoded
-				frame = streamed.InitFrame()
-			}
-		} else if s.cfg.RequireGoverned && frame.Type != TypeFileStream {
-			saveErr = fmt.Errorf("unsigned legacy frame rejected by governed receiver")
-		}
-		if saveErr == nil {
-			if governed != nil {
-				saveErr = s.admitGovernedTransfer(governed.Intent, uint64(len(governed.Payload)))
-			} else if streamed != nil {
-				declaredBytes, declaredErr := streamed.DeclaredBytes()
-				if declaredErr != nil {
-					saveErr = declaredErr
-				} else {
-					saveErr = s.admitGovernedTransfer(streamed.Intent, declaredBytes)
-				}
-			}
-		}
-		if saveErr == nil {
-			if governed != nil {
-				saveErr = s.requireGovernedRetention(governed.Disclosure)
-			} else if streamed != nil {
-				saveErr = s.requireGovernedRetention(streamed.Disclosure)
-			}
-		}
-		if saveErr == nil {
-			if governed != nil && frame.Type != TypeFileStream {
-				saveErr = s.inspectGovernedFrame(ctx, *governed)
-			}
-		}
-		if saveErr == nil {
-			switch frame.Type {
-			case TypeFileStream:
-				// Chunked/resumable transfer. The receiver emits its own
-				// control responses (INIT-ACK / ACK / COMPLETE), so skip the
-				// generic per-frame ACK below.
-				if sr == nil {
-					dir, derr := s.receivedDir()
-					if derr != nil {
-						_ = WriteFrame(conn, &Frame{Type: TypeText, Payload: []byte("ERR received dir: " + derr.Error())})
-						return
-					}
-					if mderr := os.MkdirAll(dir, 0700); mderr != nil {
-						_ = WriteFrame(conn, &Frame{Type: TypeText, Payload: []byte("ERR mkdir: " + mderr.Error())})
-						return
-					}
-					sr = NewStreamReceiverWithQuotaAndPrepareAndCommit(dir, streamNameSuffix, streamOnSaved, streamOnPrepare, streamOnCommit, s.effectiveReceivedMaxBytes())
-				}
-				kind, id, _, validStreamFrame := decodeStreamFrame(frame)
-				if !validStreamFrame {
-					_ = WriteFrame(conn, encodeComplete(id, false, "malformed stream frame"))
-					continue
-				}
-				if s.cfg.RequireGoverned {
-					if streamed == nil {
-						if kind == streamKindInit || !streamBound(governedStreams, id) {
-							_ = WriteFrame(conn, encodeComplete(id, false, "unsigned stream frame rejected by governed receiver"))
-							continue
-						}
-					} else if kind != streamKindInit {
-						_ = WriteFrame(conn, encodeComplete(id, false, "governed stream envelope must carry INIT"))
-						continue
-					}
-				}
-				if resp := sr.HandleFrame(frame); resp != nil {
-					responseKind, _, responseBody, responseValid := decodeStreamFrame(resp)
-					if streamed != nil && responseValid && responseKind == streamKindInitAck {
-						governedStreams[id] = *streamed
-					}
-					if responseValid && responseKind == streamKindComplete {
-						completeOK, _ := decodeComplete(responseBody)
-						if completeOK {
-							delete(governedStreams, id)
-						}
-					}
-					if werr := WriteFrame(conn, resp); werr != nil {
-						return
-					}
-				}
-				if kind == streamKindAbort {
-					delete(governedStreams, id)
-				}
+			_, id, _, validStreamFrame := decodeStreamFrame(frame)
+			if !validStreamFrame {
+				_ = WriteFrame(conn, encodeComplete(id, false, "malformed stream frame"))
 				continue
-			case TypeFile:
-				if frame.Filename != "" {
-					if governed != nil {
-						delivery, saveErr = s.prepareReceivedFile(frame, governed.Disclosure)
-					} else {
-						saveErr = s.saveReceivedFile(frame)
-					}
-				}
-			case TypeText, TypeJSON, TypeBinary:
-				if governed != nil {
-					delivery, saveErr = s.prepareInboxMessage(frame, conn.RemoteAddr(), governed.Disclosure)
-				} else {
-					saveErr = s.saveInboxMessage(frame, conn.RemoteAddr())
-				}
-			case TypeTrace:
-				tf, tferr := ReadTracePayload(frame)
-				if tferr != nil {
-					ackFrame = &Frame{
-						Type:    TypeText,
-						Payload: []byte(fmt.Sprintf("ERR trace parse: %v", tferr)),
-					}
-				} else {
-					innerFrame := &Frame{Type: tf.InnerType, Payload: tf.Payload, MessageID: messageID, ReplyTo: replyTo}
-					innerSaveErr := s.saveInboxMessage(innerFrame, conn.RemoteAddr())
-					inboxWrittenAtNs := time.Now().UnixNano()
-					innerAck := fmt.Sprintf("ACK %s %d bytes", TypeName(tf.InnerType), len(tf.Payload))
-					if innerSaveErr != nil {
-						innerAck = fmt.Sprintf("ERR %s save failed: %v", TypeName(tf.InnerType), innerSaveErr)
-					}
-					ackSentAtNs := time.Now().UnixNano()
-					timingJSON, _ := json.Marshal(map[string]interface{}{
-						"sent_at_ns":          tf.SentAtNs,
-						"received_at_ns":      frameReceivedAtNs,
-						"inbox_written_at_ns": inboxWrittenAtNs,
-						"ack_sent_at_ns":      ackSentAtNs,
-						"inner_ack":           innerAck,
-					})
-					ackFrame = &Frame{Type: TypeJSON, Payload: timingJSON}
-				}
-			default:
-				saveErr = fmt.Errorf("unsupported frame type %d", frame.Type)
 			}
-		}
-		if saveErr == nil && governed != nil && delivery.commit != nil {
-			if s.cfg.GovernedReceiptRecorder == nil {
-				if s.cfg.RequireGovernedReceipts {
-					saveErr = fmt.Errorf("governed receipt recorder is not configured")
+			if resp := sr.HandleFrame(frame); resp != nil {
+				if werr := WriteFrame(conn, resp); werr != nil {
+					return
 				}
-			} else if receiptErr := recordGovernedReceipt(ctx, s.cfg.GovernedReceiptRecorder, governed.Intent, governed.Decision, governed.Disclosure); receiptErr != nil {
-				if delivery.rollback != nil {
-					if rollbackErr := delivery.rollback(); rollbackErr != nil {
-						receiptErr = fmt.Errorf("%w; remove unreceipted delivery: %v", receiptErr, rollbackErr)
-					}
-				}
-				saveErr = fmt.Errorf("record governed delivery receipt: %w", receiptErr)
 			}
+			continue
+		case TypeFile:
+			if frame.Filename != "" {
+				saveErr = s.saveReceivedFile(frame)
+			}
+		case TypeText, TypeJSON, TypeBinary:
+			saveErr = s.saveInboxMessage(frame, conn.RemoteAddr())
+		case TypeTrace:
+			tf, tferr := ReadTracePayload(frame)
+			if tferr != nil {
+				ackFrame = &Frame{
+					Type:    TypeText,
+					Payload: []byte(fmt.Sprintf("ERR trace parse: %v", tferr)),
+				}
+			} else {
+				innerFrame := &Frame{Type: tf.InnerType, Payload: tf.Payload, MessageID: messageID, ReplyTo: replyTo}
+				innerSaveErr := s.saveInboxMessage(innerFrame, conn.RemoteAddr())
+				inboxWrittenAtNs := time.Now().UnixNano()
+				innerAck := fmt.Sprintf("ACK %s %d bytes", TypeName(tf.InnerType), len(tf.Payload))
+				if innerSaveErr != nil {
+					innerAck = fmt.Sprintf("ERR %s save failed: %v", TypeName(tf.InnerType), innerSaveErr)
+				}
+				ackSentAtNs := time.Now().UnixNano()
+				timingJSON, _ := json.Marshal(map[string]interface{}{
+					"sent_at_ns":          tf.SentAtNs,
+					"received_at_ns":      frameReceivedAtNs,
+					"inbox_written_at_ns": inboxWrittenAtNs,
+					"ack_sent_at_ns":      ackSentAtNs,
+					"inner_ack":           innerAck,
+				})
+				ackFrame = &Frame{Type: TypeJSON, Payload: timingJSON}
+			}
+		default:
+			// Includes the reserved TypeGoverned / TypeGovernedFileStream:
+			// refused like any type this receiver does not handle.
+			saveErr = fmt.Errorf("unsupported frame type %d", frame.Type)
 		}
-		if saveErr == nil && delivery.commit != nil {
-			delivery.commit()
-		}
-
 		if ackFrame == nil {
 			ackMsg := fmt.Sprintf("ACK %s %d bytes", TypeName(frame.Type), len(frame.Payload))
 			if saveErr != nil {
@@ -670,74 +406,6 @@ func (s *Service) handleConn(ctx context.Context, conn coreapi.Stream) {
 			}
 			return
 		}
-	}
-}
-
-func (s *Service) admitGovernedTransfer(intent decision.Intent, bytes uint64) error {
-	if s.replay != nil {
-		if err := s.replay.admit(intent); err != nil {
-			slog.Warn("governed transfer replay rejected", "agent_id", intent.AgentID, "intent_id", intent.ID, "error", err)
-			return err
-		}
-	}
-	if s.cfg.GovernedTransferQuota == nil {
-		return nil
-	}
-	if err := s.cfg.GovernedTransferQuota.Allow(intent.AgentID, bytes); err != nil {
-		slog.Warn("governed transfer quota rejected", "agent_id", intent.AgentID, "bytes", bytes, "error", err)
-		return fmt.Errorf("governed transfer quota rejected")
-	}
-	return nil
-}
-
-func streamBound(streams map[[transferIDLen]byte]GovernedStreamInit, id [transferIDLen]byte) bool {
-	_, exists := streams[id]
-	return exists
-}
-
-func (s *Service) inspectGovernedFrame(ctx context.Context, governed GovernedFrame) error {
-	if s.cfg.GovernedContentInspector == nil {
-		return nil
-	}
-	contentType := contentTypeForFrame(governed.Type, governed.Disclosure)
-	if err := s.cfg.GovernedContentInspector.InspectDisclosureContent(ctx, governed.Intent, governed.Disclosure, contentType, governed.Filename, bytes.NewReader(governed.Payload)); err != nil {
-		slog.Warn("governed content inspection rejected", "action", governed.Intent.Action, "resource", governed.Intent.Resource, "error", err)
-		return fmt.Errorf("governed content inspection rejected")
-	}
-	return nil
-}
-
-func (s *Service) inspectGovernedStreamFile(ctx context.Context, governed GovernedStreamInit, path string, filename string) error {
-	if s.cfg.GovernedContentInspector == nil {
-		return nil
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("governed content inspection rejected")
-	}
-	defer file.Close()
-	contentType := contentTypeForFrame(TypeFile, governed.Disclosure)
-	// Stream the verified on-disk body directly. A scanner that cannot process
-	// the whole file must return an error; truncating the reader would create a
-	// bypass for sensitive content placed after an arbitrary byte boundary.
-	if err := s.cfg.GovernedContentInspector.InspectDisclosureContent(ctx, governed.Intent, governed.Disclosure, contentType, filename, file); err != nil {
-		slog.Warn("governed stream content inspection rejected", "action", governed.Intent.Action, "resource", governed.Intent.Resource, "error", err)
-		return fmt.Errorf("governed content inspection rejected")
-	}
-	return nil
-}
-
-func contentTypeForFrame(frameType uint32, disclosure *decision.DisclosureBinding) string {
-	if disclosure != nil {
-		return disclosure.ContentType
-	}
-	switch frameType {
-	case TypeText:
-		return "text/plain"
-	case TypeJSON:
-		return "application/json"
-	default:
-		return "application/octet-stream"
 	}
 }
 
@@ -768,7 +436,7 @@ func (s *Service) inboxDir() (string, error) {
 }
 
 func (s *Service) saveReceivedFile(frame *Frame) error {
-	delivery, err := s.prepareReceivedFile(frame, nil)
+	delivery, err := s.prepareReceivedFile(frame)
 	if err != nil {
 		return err
 	}
@@ -776,7 +444,7 @@ func (s *Service) saveReceivedFile(frame *Frame) error {
 	return nil
 }
 
-func (s *Service) prepareReceivedFile(frame *Frame, disclosure *decision.DisclosureBinding) (persistedDelivery, error) {
+func (s *Service) prepareReceivedFile(frame *Frame) (persistedDelivery, error) {
 	dir, err := s.receivedDir()
 	if err != nil {
 		slog.Warn("save received file: cannot determine dir", "err", err)
@@ -815,25 +483,19 @@ func (s *Service) prepareReceivedFile(frame *Frame, disclosure *decision.Disclos
 	base := safeName[:len(safeName)-len(ext)]
 	destName := fmt.Sprintf("%s-%s-%06d%s", base, ts, seq, ext)
 	destPath := filepath.Join(dir, destName)
-	retention, err := s.prepareGovernedRetention(disclosure, destPath)
-	if err != nil {
-		return persistedDelivery{}, err
-	}
 
 	if err := os.WriteFile(destPath, frame.Payload, 0600); err != nil {
 		_ = os.Remove(destPath)
-		_ = retention.rollback()
 		slog.Warn("save received file: write failed", "path", destPath, "err", err)
 		return persistedDelivery{}, fmt.Errorf("write: %w", err)
 	}
 	return persistedDelivery{
 		rollback: func() error {
 			removeErr := os.Remove(destPath)
-			retentionErr := retention.rollback()
 			if removeErr != nil && !os.IsNotExist(removeErr) {
 				return removeErr
 			}
-			return retentionErr
+			return nil
 		},
 		commit: func() {
 			slog.Info("file saved", append([]any{"path", destPath, "bytes", len(frame.Payload)}, correlationAttrs(frame)...)...)
@@ -849,7 +511,7 @@ func (s *Service) prepareReceivedFile(frame *Frame, disclosure *decision.Disclos
 }
 
 func (s *Service) saveInboxMessage(frame *Frame, from protocol.Addr) error {
-	delivery, err := s.prepareInboxMessage(frame, from, nil)
+	delivery, err := s.prepareInboxMessage(frame, from)
 	if err != nil {
 		return err
 	}
@@ -857,7 +519,7 @@ func (s *Service) saveInboxMessage(frame *Frame, from protocol.Addr) error {
 	return nil
 }
 
-func (s *Service) prepareInboxMessage(frame *Frame, from protocol.Addr, disclosure *decision.DisclosureBinding) (persistedDelivery, error) {
+func (s *Service) prepareInboxMessage(frame *Frame, from protocol.Addr) (persistedDelivery, error) {
 	dir, err := s.inboxDir()
 	if err != nil {
 		return persistedDelivery{}, err
@@ -930,12 +592,7 @@ func (s *Service) prepareInboxMessage(frame *Frame, from protocol.Addr, disclosu
 		}
 	}()
 
-	retention, err := s.prepareGovernedRetention(disclosure, destPath)
-	if err != nil {
-		return persistedDelivery{}, err
-	}
 	if err := os.WriteFile(destPath, data, 0600); err != nil {
-		_ = retention.rollback()
 		return persistedDelivery{}, fmt.Errorf("write: %w", err)
 	}
 	written = true
@@ -948,11 +605,10 @@ func (s *Service) prepareInboxMessage(frame *Frame, from protocol.Addr, disclosu
 			if removeErr == nil && maxBytes > 0 {
 				s.inboxFileRemoved(size)
 			}
-			retentionErr := retention.rollback()
 			if removeErr != nil && !os.IsNotExist(removeErr) {
 				return removeErr
 			}
-			return retentionErr
+			return nil
 		},
 		commit: func() {
 			slog.Info("inbox message saved", append([]any{"path", destPath, "type", TypeName(frame.Type), "bytes", len(frame.Payload)}, correlationAttrs(frame)...)...)

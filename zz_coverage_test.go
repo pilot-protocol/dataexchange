@@ -418,8 +418,9 @@ func TestHandleConn_SaveError(t *testing.T) {
 }
 
 // TestHandleConn_UnknownType ensures an unsupported wire type is rejected.
-// Silently ACKing it would allow a sender to mistake an unverified governed
-// envelope (or a future control frame) for a successfully delivered message.
+// Silently ACKing it would allow a sender to mistake a frame this receiver
+// does not implement (a reserved governed envelope, or a future control
+// frame) for a successfully delivered message.
 func TestHandleConn_UnknownType(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()

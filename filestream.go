@@ -74,19 +74,6 @@ const (
 // fresh connection.
 var ErrStreamUnsupported = errors.New("dataexchange: peer does not support TypeFileStream")
 
-// BuildStreamInitPayload returns the deterministic INIT payload that a caller
-// must bind in a signed file.share Intent before SendGovernedFileStream. The
-// transfer ID is derived from the supplied full SHA-256, matching the sender's
-// resumable-transfer state machine.
-func BuildStreamInitPayload(name string, size int64, fullHash [32]byte) ([]byte, error) {
-	if size < 0 || !validGovernedFilename(name) {
-		return nil, fmt.Errorf("dataexchange: governed stream requires a non-negative size and safe filename")
-	}
-	var id [transferIDLen]byte
-	copy(id[:], fullHash[:transferIDLen])
-	return append([]byte(nil), encodeInit(id, uint64(size), fullHash, uint32(StreamChunkSize), name).Payload...), nil
-}
-
 // --- control-frame codec ---------------------------------------------------
 
 func encodeStreamFrame(kind byte, id [transferIDLen]byte, body []byte) *Frame {
@@ -218,8 +205,9 @@ func streamSend(conn frameRW, name string, r io.ReadSeeker, size int64, stepTime
 	})
 }
 
-// streamInitBuilder allows the sender to substitute a governed INIT envelope
-// while keeping the exact same chunk/ACK/resume state machine.
+// streamInitBuilder builds the INIT frame for a transfer, so the frame that
+// opens a stream can vary while the chunk/ACK/resume state machine stays
+// the same.
 type streamInitBuilder func([transferIDLen]byte, uint64, [32]byte, uint32, string) (*Frame, error)
 
 func streamSendWithInit(conn frameRW, name string, r io.ReadSeeker, size int64, stepTimeout time.Duration, buildInit streamInitBuilder) (*StreamResult, error) {
@@ -424,8 +412,8 @@ type StreamReceiver struct {
 	receivedDir string
 	onSaved     func(name, path string, size int64)
 	// onPrepare runs after full-content integrity verification but before the
-	// atomic rename. It lets a governed service durably record retention work
-	// for the final path before that path can become visible after a crash.
+	// atomic rename. It lets a caller durably record work for the final path
+	// before that path can become visible after a crash.
 	onPrepare func([transferIDLen]byte, string, string, int64) error
 	// onCommit runs after integrity verification and atomic rename, but before
 	// onSaved. A required receipt recorder uses it to make the visible file
@@ -477,15 +465,15 @@ func NewStreamReceiverWithQuota(receivedDir string, nameSuffix func(base string)
 }
 
 // NewStreamReceiverWithQuotaAndCommit extends the normal receiver with a
-// transactional commit hook. It is intended for governed streams: the hook
-// records evidence after the final file is durable but before consumers are
-// notified. A hook failure removes the final file and reports COMPLETE failure.
+// transactional commit hook: the hook runs after the final file is durable
+// but before consumers are notified. A hook failure removes the final file
+// and reports COMPLETE failure.
 func NewStreamReceiverWithQuotaAndCommit(receivedDir string, nameSuffix func(base string) string, onSaved func(name, path string, size int64), onCommit func([transferIDLen]byte, string, string, int64) error, quotaBytes int64) *StreamReceiver {
 	return NewStreamReceiverWithQuotaAndPrepareAndCommit(receivedDir, nameSuffix, onSaved, nil, onCommit, quotaBytes)
 }
 
 // NewStreamReceiverWithQuotaAndPrepareAndCommit adds a pre-rename durable
-// preparation hook to the governed commit path. A preparation error leaves no
+// preparation hook to the commit path. A preparation error leaves no
 // final file visible; callers may keep the partial for retry/inspection.
 func NewStreamReceiverWithQuotaAndPrepareAndCommit(receivedDir string, nameSuffix func(base string) string, onSaved func(name, path string, size int64), onPrepare, onCommit func([transferIDLen]byte, string, string, int64) error, quotaBytes int64) *StreamReceiver {
 	if nameSuffix == nil {

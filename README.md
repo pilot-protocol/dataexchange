@@ -30,10 +30,9 @@ rt.Register(dataexchange.NewService(dataexchange.ServiceConfig{}))
 
 | File | What it does |
 |---|---|
-| `dataexchange.go` | Wire format: `Frame`, `WriteFrame`, `ReadFrame`, `TraceFrame`, `TypeText/Binary/JSON/File/Trace/Governed/Tagged`, `TypeName`. |
+| `dataexchange.go` | Wire format: `Frame`, `WriteFrame`, `ReadFrame`, `TraceFrame`, `TypeText/Binary/JSON/File/Trace/Tagged`, `TypeName`. |
 | `tagged.go` | Optional request/reply correlation on the wire: `Frame.MessageID` / `Frame.ReplyTo` (`TypeTagged`), `NewMessageID`, `ValidMessageID`. |
 | `client.go` | `Client` — `Dial`, `Send` (waits for the ACK, falls back for older receivers) and send helpers. |
-| `governed.go` | Signed decision envelope, receiver-side verifier, and enforceable transport constraints. |
 | `server.go` | `Server` — accept loop and handler dispatch. |
 | `service.go` | `*Service` — `coreapi.Service` adapter. Build tag `!no_dataexchange`. |
 | `inbox_budget.go` | Inbox caps: running byte total, oldest-first eviction to 90% of the byte cap, file-count cap. |
@@ -96,8 +95,8 @@ a frame can carry two optional fields:
 | `Frame.ReplyTo` | `reply_to` | The `message_id` of the message this one answers. |
 
 IDs are 1–128 characters of `A-Z a-z 0-9 - _ . :`. They are correlation
-metadata only: they are not authenticated (a governed frame's signature does
-not cover them), so never use them for authorization.
+metadata only: they are not authenticated, so never use them for
+authorization.
 
 **If you run a service** (an agent that answers requests): when a request's
 inbox record (or `message.received` event) has a `message_id`, send your
@@ -147,8 +146,8 @@ untagged (`SendResult.Tagged == false`), and a raw `WriteFrame` returns
 `ErrTaggedFrameTooLarge` without writing anything.
 
 Whenever `Tagged` is false, the reply cannot carry `reply_to`; match it on
-the sender alone. The fields can accompany text, JSON, binary, file,
-governed and trace frames. On `TypeFileStream` frames they are ignored.
+the sender alone. The fields can accompany text, JSON, binary, file and
+trace frames. On `TypeFileStream` frames they are ignored.
 
 Wire layout of a tagged frame, for other languages:
 
@@ -169,89 +168,19 @@ without a `MessageID` are always stored, as before, unless the operator sets
 `ServiceConfig.DedupeContentWindow` (off by default) to also drop
 byte-identical copies from the same sender inside a short window.
 
-## Governed delivery
+## Reserved frame types
 
-`TypeGoverned` wraps one text, JSON, binary, or single-frame file delivery in
-the sender's signed `decision.Intent` and signed `decision.Decision`. The
-intent payload hash binds the frame type, filename, and exact bytes; the
-receiver verifies the signatures, tenant authority state, local deterministic
-ceiling, exact local destination, and any applicable transport constraints
-before it writes to disk. A workflow-approved action uses the same short-lived
-execution Decision as an ordinary allowed action—there is no reusable
-transport permit.
+Types 8 (`TypeGoverned`) and 9 (`TypeGovernedFileStream`) carried deliveries
+wrapped in an envelope signed by the hosted control plane. That control plane
+has been retired and the envelope code was removed with it. The two numbers
+stay reserved and will not be given to a new frame type, because senders built
+before the removal can still emit them.
 
-Large resumable files use `TypeGovernedFileStream`: the signed envelope binds
-the exact `TypeFileStream` INIT (filename, declared length, full SHA-256,
-chunk size, and transfer ID). Required receivers admit later chunks only for
-that verified transfer on the same connection. Compute the file hash first,
-call `BuildStreamInitPayload`, sign an Intent using
-`GovernedStreamPayloadHash`, then call `SendGovernedFileStream`.
-
-For a required typed-disclosure profile, build a `decision.DisclosureBinding`
-whose content hash, byte length, filename, and stream transfer ID match the
-file, bind its canonical hash in the signed Intent, and use
-`SendGovernedWithDisclosure` or `SendGovernedFileStreamWithDisclosure`. A
-`DecisionFrameVerifier` with `RequireDisclosure` rejects governed messages,
-single-frame files, and resumable stream INITs that omit this evidence.
-When a receipt recorder is configured, typed deliveries require its V2
-disclosure-evidence method; the resulting signed receipt binds the canonical
-disclosure hash without retaining the file or message body.
-
-Set `ServiceConfig.GovernedVerifier` to `DecisionFrameVerifier` (or an
-equivalent local verifier). Once all senders have been upgraded, set
-`ServiceConfig.RequireGoverned` to reject unsigned legacy deliveries. Roll out
-in that order: upgraded receiver with verification available, upgraded
-senders, then required mode. An older receiver does not understand
-`TypeGoverned`; a required receiver intentionally rejects `TypeTrace` and
-raw `TypeFileStream` INIT frames. Governed stream INITs are supported.
-
-For auditable enterprise ingress, configure `GovernedReceiptRecorder` and set
-`RequireGovernedReceipts`. The service writes the received message/file first,
-then requires the recorder to durably capture the exact signed Intent and
-Decision before it emits the success ACK or delivery event. If recording fails,
-the staged file is removed and the sender receives an error rather than a
-successful but unreceipted delivery.
-
-### Local content inspection
-
-`ServiceConfig.GovernedContentInspector` is an optional receiver-local hook
-that runs after the signed envelope and local policy ceiling are verified but
-before a message/file is released. Set
-`RequireGovernedContentInspection` to make startup fail unless the hook is
-present; an inspection error removes a staged file or rejects the message.
-`decision.PresidioInspector` is the included OSS adapter for bounded text,
-JSON, XML, YAML, and form content. It rejects unsupported binary/document
-types rather than truncating or silently skipping them. The inspector is local
-to the receiver; neither the decision authority nor the sender's authority
-receives plaintext for this check.
-
-Typed disclosure binding V2 adds a tenant-defined `retention_class` to the
-same Intent hash. A signed policy can select allowed classes; the receiver sees
-the bound metadata. Configure `GovernedRetentionPolicies` to map those classes
-to local expiry durations. The service writes an owner-only retention journal
-before a governed message/file becomes accepted (and before a streamed file's
-final rename), then removes the content after expiry across restarts. An
-unknown, V1, or unconfigured class is rejected when retention is enabled.
-This is deletion retention, not a legal-hold or WORM-storage implementation.
-
-### Per-agent transfer quotas
-
-`ServiceConfig.GovernedTransferQuota` admits a bounded number of bytes and/or
-actions for each signed `Intent.AgentID` in a fixed local window. It is charged
-only after governed verification, including the declared bytes of a verified
-stream INIT; a peer address cannot select or reset another agent's budget.
-Quota is deliberately charged for an admitted attempt even if later local DLP
-or receipt persistence rejects it, so repeatedly failing submissions cannot
-turn the scanner into an unmetered denial-of-service target.
-
-The v1 action mapping is:
-
-| Frame | Intent action |
-|---|---|
-| text | `data.send.text` |
-| JSON | `data.send.json` |
-| binary | `data.send.binary` |
-| file | `file.share` |
+A receiver treats both like any frame type it does not implement: it stores
+nothing, publishes no event, answers
+`ERR GOVERNED save failed: unsupported frame type 8` (or
+`ERR GOVERNED_FILESTREAM save failed: unsupported frame type 9`), and keeps
+the connection open for further frames.
 
 ## Build tags
 
