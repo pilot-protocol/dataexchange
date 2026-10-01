@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- Governed delivery. The signed-envelope frames `TypeGoverned` (8) and
+  `TypeGovernedFileStream` (9) carried decisions issued by the hosted control
+  plane, which has been retired; the daemon stopped configuring the receiver
+  gates in v1.14.0, so the code could no longer be reached. Removed: every
+  exported `Governed*` identifier (the frame and stream-INIT envelopes and
+  their codecs, the verifier and receipt-recorder interfaces, the payload
+  hash helpers, `GovernedRetentionPolicy`), `DecisionFrameVerifier`,
+  `Client.SendGoverned*`, `BuildStreamInitPayload`, and the `ServiceConfig`
+  fields `RequireGoverned`, `GovernedVerifier`, `GovernedStreamVerifier`,
+  `RequireGovernedReceipts`, `GovernedReceiptRecorder`,
+  `GovernedContentInspector`, `RequireGovernedContentInspection`,
+  `GovernedTransferQuota`, `GovernedRetentionPolicies`, `RetentionStateDir`
+  and `RetentionSweepInterval`. The module no longer imports
+  `github.com/pilot-protocol/common/decision`.
+- Frame types 8 and 9 stay reserved and keep their constants and names. A
+  receiver refuses them like any unsupported type: nothing is stored and the
+  sender gets `ERR GOVERNED save failed: unsupported frame type 8` (or
+  `ERR GOVERNED_FILESTREAM ... type 9`); the connection stays open.
+
 ### Fixed
 
 - The inbox byte cap no longer deletes the whole inbox. With the default

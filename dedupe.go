@@ -181,7 +181,7 @@ func (d *deliveryDedupe) len() int {
 // Streams have their own resume protocol and trace frames are diagnostics.
 func dedupeEligible(frameType uint32) bool {
 	switch frameType {
-	case TypeText, TypeJSON, TypeBinary, TypeFile, TypeGoverned:
+	case TypeText, TypeJSON, TypeBinary, TypeFile:
 		return true
 	default:
 		return false

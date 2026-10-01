@@ -22,7 +22,6 @@ import (
 	"time"
 
 	"github.com/pilot-protocol/common/coreapi"
-	"github.com/pilot-protocol/common/decision"
 	"github.com/pilot-protocol/common/protocol"
 )
 
@@ -375,37 +374,6 @@ func TestService_FailedDeliveryIsNotRemembered(t *testing.T) {
 	}
 }
 
-func TestService_TaggedGovernedFrameKeepsCorrelation(t *testing.T) {
-	t.Parallel()
-	tmp := t.TempDir()
-	governed, verifier := newGovernedTestFrame(t, &Frame{Type: TypeText, Payload: []byte("approved")}, decision.Allow, nil)
-	svc := NewService(ServiceConfig{InboxDir: tmp, RequireGoverned: true, GovernedVerifier: verifier})
-	conn := openServiceConn(t, svc, peerA)
-
-	envelope, err := EncodeGovernedFrame(governed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	envelope.MessageID, envelope.ReplyTo = "gov-1", "req-7"
-	res := mustSend(t, conn, envelope)
-	if !res.Tagged || string(res.Ack.Payload) != "ACK TEXT 8 bytes" {
-		t.Fatalf("result=%+v ack=%q", res, res.Ack.Payload)
-	}
-	recs := inboxRecords(t, tmp)
-	if len(recs) != 1 || recs[0]["message_id"] != "gov-1" || recs[0]["reply_to"] != "req-7" || recs[0]["data"] != "approved" {
-		t.Fatalf("records = %v", recs)
-	}
-	// An identical re-delivery is acknowledged as a duplicate instead of
-	// tripping the governed replay guard with an error.
-	res = mustSend(t, conn, envelope)
-	if !res.Duplicate || string(res.Ack.Payload) != "ACK TEXT 8 bytes (duplicate)" {
-		t.Fatalf("re-delivery result=%+v ack=%q", res, res.Ack.Payload)
-	}
-	if n := len(inboxRecords(t, tmp)); n != 1 {
-		t.Fatalf("inbox records = %d, want 1", n)
-	}
-}
-
 func TestService_TaggedTraceFrameKeepsCorrelation(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
@@ -464,8 +432,9 @@ const (
 	// genRejectUnknown is v0.2.2 and later, before TypeTagged: an unknown
 	// type is answered "ERR UNKNOWN(<n>) save failed: unsupported frame type <n>".
 	genRejectUnknown
-	// genRejectUnknownGoverned is genRejectUnknown with RequireGoverned,
-	// which rejects every non-governed type before looking at it.
+	// genRejectUnknownGoverned is genRejectUnknown with RequireGoverned (a
+	// receiver gate those releases had, removed since), which rejects every
+	// non-governed type before looking at it.
 	genRejectUnknownGoverned
 )
 
@@ -624,18 +593,17 @@ func TestSend_CurrentReceiverKeepsTagsForEveryType(t *testing.T) {
 }
 
 // TestSend_NewReceiverRejectionIsNotRetried: a current receiver that rejects
-// a tagged frame (here: unsigned under RequireGoverned) must not trigger the
-// old-receiver fallback.
+// a tagged frame (here: the message is larger than the inbox byte cap) must
+// not trigger the old-receiver fallback.
 func TestSend_NewReceiverRejectionIsNotRetried(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
-	_, verifier := newGovernedTestFrame(t, &Frame{Type: TypeText, Payload: []byte("x")}, decision.Allow, nil)
-	conn := openServiceConn(t, NewService(ServiceConfig{InboxDir: tmp, RequireGoverned: true, GovernedVerifier: verifier}), peerA)
-	res, err := sendAndAwaitAck(conn, &Frame{Type: TypeText, Payload: []byte("unsigned"), MessageID: "m-1"})
+	conn := openServiceConn(t, NewService(ServiceConfig{InboxDir: tmp, InboxMaxBytes: 1}), peerA)
+	res, err := sendAndAwaitAck(conn, &Frame{Type: TypeText, Payload: []byte("too large"), MessageID: "m-1"})
 	if !errors.Is(err, ErrRejected) || res == nil || !res.Tagged {
 		t.Fatalf("res=%+v err=%v", res, err)
 	}
-	if !strings.HasPrefix(string(res.Ack.Payload), "ERR TEXT save failed: unsigned legacy frame rejected") {
+	if !strings.HasPrefix(string(res.Ack.Payload), "ERR TEXT save failed: inbox byte budget exceeded") {
 		t.Fatalf("ack = %q", res.Ack.Payload)
 	}
 	if n := len(inboxRecords(t, tmp)); n != 0 {

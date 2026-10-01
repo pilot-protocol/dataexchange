@@ -33,13 +33,14 @@ const (
 	// peer that does not understand TypeFileStream never sends INIT-ACK, so
 	// the sender falls back to TypeFile.
 	TypeFileStream uint32 = 7
-	// TypeGoverned carries a regular data frame together with the sender's
-	// signed intent and authority decision. It is opt-in; enterprise receivers
-	// can require this envelope before persisting a message or file.
-	TypeGoverned uint32 = 8
-	// TypeGovernedFileStream carries the signed authorization evidence for a
-	// TypeFileStream INIT. Subsequent chunks are accepted only while bound to
-	// that verified transfer ID on the same connection.
+	// TypeGoverned and TypeGovernedFileStream are reserved. They carried a
+	// data frame (8) or a TypeFileStream INIT (9) inside an envelope signed
+	// by the hosted control plane, which has been retired; the envelope
+	// codec and its receiver gates were removed with it. The numbers must
+	// not be reused: senders built before the removal can still emit them,
+	// and a receiver refuses both as unsupported frame types without
+	// storing anything.
+	TypeGoverned           uint32 = 8
 	TypeGovernedFileStream uint32 = 9
 	// TypeTagged wraps another frame with optional correlation metadata
 	// (Frame.MessageID / Frame.ReplyTo). Callers never set it directly:
