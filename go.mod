@@ -3,6 +3,6 @@ module github.com/pilot-protocol/dataexchange
 go 1.25.13
 
 require (
-	github.com/pilot-protocol/common v0.6.0
+	github.com/pilot-protocol/common v0.6.1
 	github.com/pilot-protocol/eventstream v0.3.0
 )
