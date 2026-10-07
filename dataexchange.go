@@ -195,12 +195,28 @@ func WriteFrame(w io.Writer, f *Frame) error {
 	var hdr [8]byte
 	binary.BigEndian.PutUint32(hdr[0:4], ftype)
 	binary.BigEndian.PutUint32(hdr[4:8], uint32(len(payload)))
+	// A small frame goes out as one write. Written as header-then-payload,
+	// the payload is a second small write on a stream that still has the
+	// header unacknowledged: Nagle holds it until the peer's delayed ACK
+	// fires, ~40ms per frame on daemons that delay ACKs for short segments.
+	if len(payload) <= singleWriteMax {
+		buf := make([]byte, len(hdr)+len(payload))
+		copy(buf, hdr[:])
+		copy(buf[len(hdr):], payload)
+		_, err = w.Write(buf)
+		return err
+	}
 	if _, err := w.Write(hdr[:]); err != nil {
 		return err
 	}
 	_, err = w.Write(payload)
 	return err
 }
+
+// singleWriteMax is the largest payload WriteFrame copies next to its header
+// to send both in one write. Above it the copy costs more than it saves: the
+// payload spans many segments and is not held back by Nagle.
+const singleWriteMax = 64 * 1024
 
 // ReadFrame reads a frame from a reader.
 func ReadFrame(r io.Reader) (*Frame, error) {

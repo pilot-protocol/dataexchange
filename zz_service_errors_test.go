@@ -122,10 +122,11 @@ func TestWriteFrame_HeaderWriteError(t *testing.T) {
 
 // TestWriteFrame_PayloadWriteError forces the SECOND w.Write to fail (the
 // payload), exercising the path where the header lands but the body errors.
+// Only a payload above singleWriteMax is written separately from its header.
 func TestWriteFrame_PayloadWriteError(t *testing.T) {
 	t.Parallel()
 	fw := &failingWriter{failAfter: 1} // first write OK, second fails
-	err := WriteFrame(fw, &Frame{Type: TypeText, Payload: []byte("payload")})
+	err := WriteFrame(fw, &Frame{Type: TypeText, Payload: make([]byte, singleWriteMax+1)})
 	if err == nil {
 		t.Error("expected payload-write error")
 	}
