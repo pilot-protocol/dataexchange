@@ -489,7 +489,10 @@ type recvTransfer struct {
 // over. That is a sender retrying after a stall: it reconnects while this
 // receiver still holds the stalled connection open (until the idle timeout,
 // minutes later). The retry takes the .partial over and resumes where the
-// stalled transfer stopped; the stalled one is refused any further write.
+// stalled transfer stopped; the stalled one is refused any further write,
+// its DONE, and the file itself if it sends a new INIT. Only an INIT that is
+// accepted takes a claim over: one refused for quota, disk space or too many
+// transfers leaves the quiet holder its file.
 var activePartials = struct {
 	sync.Mutex
 	paths map[string]*partialClaim
@@ -500,26 +503,60 @@ type partialClaim struct {
 	lastWrite time.Time
 }
 
-// staleClaimAfter is how long a claim's holder may go without writing before
-// another transfer of the same content may take the claim over. A variable so
-// tests can shorten it.
-var staleClaimAfter = 10 * time.Second
+// live reports whether c's holder has written recently enough to keep it.
+// Caller holds activePartials.
+func (c *partialClaim) live() bool {
+	return time.Since(c.lastWrite) < staleClaimAfter
+}
 
-// claimPartial takes path for a new transfer. It returns nil when a live
-// transfer holds it.
-func claimPartial(path string) *partialClaim {
+// staleClaimAfter is how long a claim's holder may go without writing before
+// another transfer of the same content may take the claim over.
+//
+// It is twice streamStepTimeout, the sender's default wait for each ACK
+// before it gives up (pilotctl send-file sets 90s). A live transfer can be
+// quiet for most of that wait — retransmission backoff, a very slow link.
+// Taking its file over then would fail a transfer that was still going, and
+// its sender would report the file rejected even though the other transfer
+// delivered the content.
+//
+// The cost is on the retry side. A retry that arrives within this window —
+// a sender reconnecting quickly while this receiver still holds the
+// half-open connection of its first attempt — finds the .partial held, gets
+// a private file like any concurrent transfer of the same content, and
+// starts over from offset 0. The first attempt's .partial stays on disk
+// meanwhile and counts against the quota (near the quota, enough to get the
+// retry refused) until its connection times out and a later retry resumes
+// it.
+//
+// A variable so tests can shorten it.
+var staleClaimAfter = 2 * streamStepTimeout
+
+// partialHeld reports whether a live transfer holds path.
+func partialHeld(path string) bool {
 	activePartials.Lock()
 	defer activePartials.Unlock()
-	if held, ok := activePartials.paths[path]; ok && time.Since(held.lastWrite) < staleClaimAfter {
-		return nil
+	held := activePartials.paths[path]
+	return held != nil && held.live()
+}
+
+// claimPartial takes path for a new transfer, taking it over from a holder
+// that has gone quiet; prev is that holder's claim (nil if path was free).
+// It returns a nil claim when a live transfer holds path.
+func claimPartial(path string) (c, prev *partialClaim) {
+	activePartials.Lock()
+	defer activePartials.Unlock()
+	prev = activePartials.paths[path]
+	if prev != nil && prev.live() {
+		return nil, nil
 	}
-	c := &partialClaim{lastWrite: time.Now()}
+	c = &partialClaim{lastWrite: time.Now()}
 	activePartials.paths[path] = c
-	return c
+	return c, prev
 }
 
 // stillHolds reports whether c is still the claim on path, and records a
-// write by its holder when it is.
+// write by its holder when it is. A claim just refreshed cannot be taken
+// over for staleClaimAfter, so a holder may act on the file right after.
 func stillHolds(path string, c *partialClaim) bool {
 	if c == nil {
 		return true // a transfer that never needed a claim
@@ -535,11 +572,32 @@ func stillHolds(path string, c *partialClaim) bool {
 
 // releasePartial gives up c's claim on path, if it still holds it.
 func releasePartial(path string, c *partialClaim) {
+	unclaimPartial(path, c, nil)
+}
+
+// unclaimPartial gives up c's claim on path, if it still holds it, and hands
+// the path back to prev, the claim c took over (nil: leave it free).
+func unclaimPartial(path string, c, prev *partialClaim) {
 	activePartials.Lock()
-	if activePartials.paths[path] == c {
+	defer activePartials.Unlock()
+	if activePartials.paths[path] != c {
+		return
+	}
+	if prev != nil {
+		activePartials.paths[path] = prev
+	} else {
 		delete(activePartials.paths, path)
 	}
-	activePartials.Unlock()
+}
+
+// privatePartial names a .partial only one transfer uses, beside the
+// content-addressed one at shared.
+func privatePartial(shared string) (string, error) {
+	var suffix [4]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		return "", err
+	}
+	return shared + "." + hex.EncodeToString(suffix[:]), nil
 }
 
 // release gives up t's claim on its .partial and, for a private one, removes
@@ -667,31 +725,74 @@ func (sr *StreamReceiver) handleInit(id [transferIDLen]byte, body []byte) *Frame
 	if err := os.MkdirAll(partialDir, 0700); err != nil {
 		return encodeComplete(id, false, "mkdir partial: "+err.Error())
 	}
-	partial := filepath.Join(partialDir, hex.EncodeToString(id[:]))
-	private := false
-	var claim *partialClaim
+	shared := filepath.Join(partialDir, hex.EncodeToString(id[:]))
+
 	sr.mu.Lock()
 	prior := sr.transfers[id]
+	if prior != nil && !stillHolds(prior.partial, prior.claim) {
+		// A second INIT for a transfer whose .partial a retry on another
+		// connection has since taken over. The file is the retry's now:
+		// drop this transfer without touching it, and start over as a new
+		// one.
+		delete(sr.transfers, id)
+		if prior.file != nil {
+			_ = prior.file.Close()
+		}
+		prior = nil
+	}
+	// A new id when already at capacity is refused before anything else:
+	// no claim taken, no descriptor opened.
+	full := prior == nil && len(sr.transfers) >= maxConcurrentTransfers
 	sr.mu.Unlock()
+	if full {
+		return encodeComplete(id, false, "too many concurrent transfers")
+	}
+
+	partial, private := shared, false
+	goPrivate := func() error {
+		p, err := privatePartial(shared)
+		partial, private = p, true
+		return err
+	}
+	var claim, prev *partialClaim
 	if prior != nil {
 		// A second INIT for a transfer this receiver already holds: keep
-		// its .partial (and the claim on it).
+		// its .partial (and the claim on it, refreshed just above).
 		partial, private, claim = prior.partial, prior.private, prior.claim
-	} else if claim = claimPartial(partial); claim == nil {
+	} else if partialHeld(shared) {
 		// Another live transfer is writing this content. Take a private
 		// .partial rather than share the file with it.
-		var suffix [4]byte
-		if _, err := rand.Read(suffix[:]); err != nil {
+		if err := goPrivate(); err != nil {
 			return encodeComplete(id, false, "partial name: "+err.Error())
 		}
-		partial += "." + hex.EncodeToString(suffix[:])
-		private = true
-		claim = claimPartial(partial)
 	}
-	// fail reports a refused INIT, giving back the claim just taken.
+
+	// Everything that can refuse the transfer runs before the claim is
+	// taken: an INIT that is refused must not take the .partial over from a
+	// holder that has only gone quiet.
+	quotaBudget, refusal := sr.admit(partial, size)
+	if refusal != "" {
+		return encodeComplete(id, false, refusal)
+	}
+	if prior == nil {
+		if claim, prev = claimPartial(partial); claim == nil {
+			// A live transfer of the same content claimed the .partial
+			// since partialHeld looked. Go private after all; that file
+			// starts empty, so check again.
+			if err := goPrivate(); err != nil {
+				return encodeComplete(id, false, "partial name: "+err.Error())
+			}
+			if quotaBudget, refusal = sr.admit(partial, size); refusal != "" {
+				return encodeComplete(id, false, refusal)
+			}
+			claim, prev = claimPartial(partial)
+		}
+	}
+	// fail reports an INIT refused after the claim was taken, handing the
+	// claim back to the transfer it was taken from.
 	fail := func(reason string) *Frame {
 		if prior == nil {
-			releasePartial(partial, claim)
+			unclaimPartial(partial, claim, prev)
 			if private {
 				_ = os.Remove(partial)
 			}
@@ -699,67 +800,31 @@ func (sr *StreamReceiver) handleInit(id [transferIDLen]byte, body []byte) *Frame
 		return encodeComplete(id, false, reason)
 	}
 
-	// Quota gate: reject up front if the declared size cannot fit alongside
-	// what is already on disk (excluding this transfer's own .partial, which
-	// resume credits back). Bounds disk use before a single chunk lands.
-	quotaBudget := int64(-1)
-	if sr.quotaBytes > 0 {
-		used := dirSizeExcluding(sr.receivedDir, partial)
-		budget := sr.quotaBytes - used
-		if budget < 0 {
-			budget = 0
-		}
-		if int64(size) > budget {
-			return fail(fmt.Sprintf("receiver disk quota exceeded: need %d, %d of %d available",
-				size, budget, sr.quotaBytes))
-		}
-		quotaBudget = budget
-	}
-
 	file, err := os.OpenFile(partial, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
 		return fail("open partial: " + err.Error())
 	}
-	// Resume from the contiguous bytes already on disk. Because we only
-	// ever write contiguously, the file size IS the resume offset. Guard
-	// against a stale/oversized .partial.
-	info, err := file.Stat()
-	var resume uint64
-	if err == nil && info.Size() >= 0 && uint64(info.Size()) <= size {
-		resume = uint64(info.Size())
-	} else {
-		_ = file.Truncate(0)
-		resume = 0
-	}
-
-	// Disk gate: the quota is a fixed number and can be larger than the
-	// disk. Refuse now what cannot fit, instead of failing mid-transfer with
-	// the disk full and the bytes already written stranded in a .partial.
-	if free, ok := freeDiskBytes(partialDir); ok {
-		need := size - resume
-		if need > free || free-need < diskReserveBytes {
-			_ = file.Close()
-			if resume == 0 {
-				_ = os.Remove(partial)
-			}
-			return fail(fmt.Sprintf("receiver disk full: need %d bytes, %d free (keeping %d in reserve)",
-				need, free, int64(diskReserveBytes)))
-		}
-	}
 
 	sr.mu.Lock()
-	// Replace any stale in-memory transfer for this id (e.g. a prior conn).
-	if old := sr.transfers[id]; old != nil {
-		if old.file != nil {
-			_ = old.file.Close()
-		}
-	} else if len(sr.transfers) >= maxConcurrentTransfers {
-		// New id and already at capacity: refuse rather than opening
-		// another descriptor. Release the file we just opened, or this
-		// rejection would leak the very FD it exists to protect.
+	old := sr.transfers[id]
+	if old == nil && len(sr.transfers) >= maxConcurrentTransfers {
+		// Checked above, but another INIT can have taken the last slot
+		// since. Release the file we just opened, or this rejection would
+		// leak the very FD it exists to protect.
 		sr.mu.Unlock()
 		_ = file.Close()
 		return fail("too many concurrent transfers")
+	}
+	// Resume from the contiguous bytes already on disk, as admit counted
+	// on. A stale/oversized .partial starts over.
+	info, err := file.Stat()
+	resume := resumeOffset(info, err, size)
+	if resume == 0 {
+		_ = file.Truncate(0)
+	}
+	// Replace the in-memory transfer this INIT repeats, if any.
+	if old != nil && old.file != nil {
+		_ = old.file.Close()
 	}
 	sr.transfers[id] = &recvTransfer{
 		file:        file,
@@ -776,6 +841,54 @@ func (sr *StreamReceiver) handleInit(id [transferIDLen]byte, body []byte) *Frame
 	sr.mu.Unlock()
 
 	return encodeOffset(streamKindInitAck, id, resume)
+}
+
+// admit runs the checks that can refuse a transfer of size bytes into
+// partial, without touching the file. It returns the transfer's quota budget
+// (-1 without a quota), or why the transfer is refused.
+func (sr *StreamReceiver) admit(partial string, size uint64) (quotaBudget int64, refusal string) {
+	// Quota gate: reject up front if the declared size cannot fit alongside
+	// what is already on disk (excluding this transfer's own .partial, which
+	// resume credits back). Bounds disk use before a single chunk lands.
+	quotaBudget = -1
+	if sr.quotaBytes > 0 {
+		used := dirSizeExcluding(sr.receivedDir, partial)
+		budget := sr.quotaBytes - used
+		if budget < 0 {
+			budget = 0
+		}
+		// Compared unsigned: a declared size past the int64 range would
+		// otherwise come out negative and pass.
+		if size > uint64(budget) {
+			return 0, fmt.Sprintf("receiver disk quota exceeded: need %d, %d of %d available",
+				size, budget, sr.quotaBytes)
+		}
+		quotaBudget = budget
+	}
+
+	// Disk gate: the quota is a fixed number and can be larger than the
+	// disk. Refuse now what cannot fit, instead of failing mid-transfer with
+	// the disk full and the bytes already written stranded in a .partial.
+	if free, ok := freeDiskBytes(filepath.Dir(partial)); ok {
+		info, err := os.Stat(partial)
+		need := size - resumeOffset(info, err, size)
+		if need > free || free-need < diskReserveBytes {
+			return 0, fmt.Sprintf("receiver disk full: need %d bytes, %d free (keeping %d in reserve)",
+				need, free, int64(diskReserveBytes))
+		}
+	}
+	return quotaBudget, ""
+}
+
+// resumeOffset is where a transfer of size bytes picks up in a .partial
+// described by info (err from the stat). We only ever write contiguously, so
+// the file size IS the resume offset — unless there is no file, or it is
+// longer than the transfer and so stale: then it starts over at 0.
+func resumeOffset(info os.FileInfo, err error, size uint64) uint64 {
+	if err == nil && info.Size() >= 0 && uint64(info.Size()) <= size {
+		return uint64(info.Size())
+	}
+	return 0
 }
 
 func (sr *StreamReceiver) handleChunk(id [transferIDLen]byte, body []byte) *Frame {
@@ -802,8 +915,7 @@ func (sr *StreamReceiver) handleChunk(id [transferIDLen]byte, body []byte) *Fram
 	case off == t.cursor:
 		if werr := sr.writeAt(t, off, data); werr != nil {
 			sr.mu.Unlock()
-			sr.abandonIfDiskFull(id, werr)
-			return encodeComplete(id, false, werr.Error())
+			return sr.writeFailed(id, werr)
 		}
 		// Drain any buffered successors.
 		for {
@@ -815,8 +927,7 @@ func (sr *StreamReceiver) handleChunk(id [transferIDLen]byte, body []byte) *Fram
 			t.pendBytes -= len(next)
 			if werr := sr.writeAt(t, t.cursor, next); werr != nil {
 				sr.mu.Unlock()
-				sr.abandonIfDiskFull(id, werr)
-				return encodeComplete(id, false, werr.Error())
+				return sr.writeFailed(id, werr)
 			}
 		}
 	case off > t.cursor:
@@ -855,6 +966,19 @@ func (sr *StreamReceiver) writeAt(t *recvTransfer, off uint64, data []byte) erro
 	return nil
 }
 
+// writeFailed answers a chunk whose write failed. A transfer whose file a
+// retry has taken over can never write again, so it is ended here rather than
+// holding its descriptor until the connection closes; one that ran the disk
+// full is abandoned.
+func (sr *StreamReceiver) writeFailed(id [transferIDLen]byte, werr error) *Frame {
+	if errors.Is(werr, errPartialTakenOver) {
+		sr.discard(id)
+	} else {
+		sr.abandonIfDiskFull(id, werr)
+	}
+	return encodeComplete(id, false, werr.Error())
+}
+
 func (sr *StreamReceiver) handleDone(id [transferIDLen]byte) *Frame {
 	sr.mu.Lock()
 	t := sr.transfers[id]
@@ -864,7 +988,7 @@ func (sr *StreamReceiver) handleDone(id [transferIDLen]byte) *Frame {
 	}
 	if !stillHolds(t.partial, t.claim) {
 		// A retry of this transfer has taken the file over; it finishes it.
-		sr.forget(id)
+		sr.discard(id)
 		return encodeComplete(id, false, errPartialTakenOver.Error())
 	}
 
@@ -875,12 +999,18 @@ func (sr *StreamReceiver) handleDone(id [transferIDLen]byte) *Frame {
 		return encodeComplete(id, false, fmt.Sprintf("incomplete: have %d of %d bytes", t.cursor, t.size))
 	}
 
-	// Verify the full content hash before accepting the file.
+	// Verify the full content hash before accepting the file. Reading
+	// through the claim keeps it fresh while a large file is hashed, and
+	// stops the hash if a retry has taken the file over all the same.
 	if _, err := t.file.Seek(0, io.SeekStart); err != nil {
 		return encodeComplete(id, false, "seek for verify: "+err.Error())
 	}
 	h := sha256.New()
-	if _, err := io.Copy(h, t.file); err != nil {
+	if _, err := io.Copy(h, heldReader{t}); err != nil {
+		if errors.Is(err, errPartialTakenOver) {
+			sr.discard(id)
+			return encodeComplete(id, false, err.Error())
+		}
 		return encodeComplete(id, false, "read for verify: "+err.Error())
 	}
 	if !bytes.Equal(h.Sum(nil), t.hash[:]) {
@@ -897,6 +1027,14 @@ func (sr *StreamReceiver) handleDone(id [transferIDLen]byte) *Frame {
 			sr.forget(id)
 			return encodeComplete(id, false, "prepare: "+err.Error())
 		}
+	}
+	// The claim again, right before the rename: fsync, the hash and
+	// onPrepare all take time, and a retry that took the file over
+	// meanwhile is writing it now. The check refreshes the claim, so it
+	// cannot be taken over between here and the rename.
+	if !stillHolds(t.partial, t.claim) {
+		sr.forget(id)
+		return encodeComplete(id, false, errPartialTakenOver.Error())
 	}
 	if err := os.Rename(t.partial, finalPath); err != nil {
 		// Drop the in-memory transfer. t.file was already closed above, so
@@ -923,6 +1061,19 @@ func (sr *StreamReceiver) handleDone(id [transferIDLen]byte) *Frame {
 		sr.onSaved(finalName, finalPath, int64(t.size))
 	}
 	return encodeComplete(id, true, "")
+}
+
+// heldReader reads t's .partial while t still holds its claim, refreshing the
+// claim on every read so a long verification does not make the transfer look
+// stalled. Once a retry has taken the file over it fails with
+// errPartialTakenOver.
+type heldReader struct{ t *recvTransfer }
+
+func (r heldReader) Read(p []byte) (int, error) {
+	if !stillHolds(r.t.partial, r.t.claim) {
+		return 0, errPartialTakenOver
+	}
+	return r.t.file.Read(p)
 }
 
 // discard closes and forgets a transfer but leaves the .partial on disk
@@ -960,11 +1111,21 @@ func (sr *StreamReceiver) abandonIfDiskFull(id [transferIDLen]byte, werr error) 
 	}
 	sr.mu.Lock()
 	t := sr.transfers[id]
+	delete(sr.transfers, id)
 	sr.mu.Unlock()
-	sr.discard(id)
-	if t != nil {
+	if t == nil {
+		return
+	}
+	if t.file != nil {
+		_ = t.file.Close()
+	}
+	// Delete the file while the claim is still held, then release it: once
+	// released, another transfer can claim the path and create a new file
+	// there. A retry that has taken the file over owns it; leave it be.
+	if stillHolds(t.partial, t.claim) {
 		_ = os.Remove(t.partial)
 	}
+	t.release()
 }
 
 // Close releases any open .partial handles (call on connection teardown).

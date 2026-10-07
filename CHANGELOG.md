@@ -37,14 +37,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rename. The first transfer keeps the resumable `.partial`; a concurrent one
   gets a private file that is removed if it does not finish. A sender that
   stalls and retries still resumes: once the transfer holding the `.partial`
-  has written nothing for 10 seconds, the retry takes the file over and the
-  stalled transfer is refused any further write.
+  has written nothing for two minutes (twice the sender's default wait for an
+  ACK), the retry takes the file over, and the stalled transfer is refused
+  any further write, its DONE, and the file itself if it starts over. A retry
+  sooner than that starts over in a private file. A transfer refused at the
+  start never takes a file over.
 - A file that cannot fit on the receiver's disk is refused before any byte is
   sent. The byte quota is a fixed number and can be larger than the disk, so a
   transfer ran until the disk was full, failed, and left its bytes in
   `.partial` — where they kept the disk full and blocked incoming messages.
   The receiver now checks free space at the start (keeping 16 MiB in reserve),
   and if a write still hits a full disk it deletes that `.partial`.
+- A streamed transfer declaring a size of 2^63 bytes or more is refused by the
+  receiver's byte quota. The size was converted to a negative number and
+  passed the check.
 - A sender whose transfer is refused at the start (quota, disk full, too many
   transfers) reports the refusal. It was mistaken for a receiver too old to
   support streamed transfers, so the caller retried with the single-frame

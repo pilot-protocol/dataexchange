@@ -288,6 +288,14 @@ func TestFileStream_RetryTakesOverAStalledTransfer(t *testing.T) {
 	if ok, msg := decodeComplete(body); ok || !strings.Contains(msg, "taken it over") {
 		t.Fatalf("stalled transfer's chunk: ok=%v %q", ok, msg)
 	}
+	// It cannot write again, so it is ended rather than holding its file
+	// open until the connection closes.
+	stalled.mu.Lock()
+	_, kept := stalled.transfers[id]
+	stalled.mu.Unlock()
+	if kept {
+		t.Error("the stalled transfer was kept after its file was taken over")
+	}
 
 	for i := 1; i < 3; i++ {
 		if kind, _ := send(retry, chunk(i)); kind != streamKindAck {
