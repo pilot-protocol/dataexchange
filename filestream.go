@@ -195,8 +195,13 @@ type frameRW interface {
 //
 // Returns ErrStreamUnsupported if the peer never answers INIT with an
 // INIT-ACK within the negotiation window — the caller should fall back to
-// SendFile on a fresh connection. stepTimeout bounds the wait for any single
-// ACK and for the final COMPLETE (0 ⇒ default).
+// SendFile on a fresh connection. A receiver that refuses the transfer at
+// INIT (quota, disk space, too many transfers) answers with a COMPLETE
+// instead; that comes back as a StreamResult with OK false and the reason in
+// Message, and a nil error — not as ErrStreamUnsupported, since falling back
+// would push the whole file at a peer that has just declined it.
+// stepTimeout bounds the wait for any single ACK and for the final COMPLETE
+// (0 ⇒ default).
 func (c *Client) SendFileStream(name string, r io.ReadSeeker, size int64, stepTimeout time.Duration) (*StreamResult, error) {
 	return streamSend(c.conn, name, r, size, stepTimeout)
 }
