@@ -175,12 +175,21 @@ func TestFileStream_DiskFullMidTransferRemovesPartial(t *testing.T) {
 		}
 	}()
 	go func() { _, _ = streamSend(cli, "f.bin", bytes.NewReader(data), int64(len(data)), time.Second) }()
+	// Wait for the transfer to be registered, not just for its file: INIT
+	// creates the .partial before it records the transfer, and abandoning
+	// an unrecorded transfer does nothing.
+	registered := func() bool {
+		sr.mu.Lock()
+		defer sr.mu.Unlock()
+		_, ok := sr.transfers[id]
+		return ok
+	}
 	deadline := time.Now().Add(2 * time.Second)
-	for len(partialFiles(t, dir)) == 0 && time.Now().Before(deadline) {
+	for !registered() && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if len(partialFiles(t, dir)) != 1 {
-		t.Fatalf("expected one partial after INIT, have %v", partialFiles(t, dir))
+	if len(partialFiles(t, dir)) != 1 || !registered() {
+		t.Fatalf("expected one registered partial after INIT, have %v", partialFiles(t, dir))
 	}
 
 	sr.abandonIfDiskFull(id, fmt.Errorf("write at 0: %w", os.ErrPermission))
