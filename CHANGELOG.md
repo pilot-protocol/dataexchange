@@ -47,7 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transfer ran until the disk was full, failed, and left its bytes in
   `.partial` — where they kept the disk full and blocked incoming messages.
   The receiver now checks free space at the start (keeping 16 MiB in reserve),
-  and if a write still hits a full disk it deletes that `.partial`.
+  and if a write still hits a full disk or disk quota it deletes that
+  `.partial`.
 - A streamed transfer declaring a size of 2^63 bytes or more is refused by the
   receiver's byte quota. The size was converted to a negative number and
   passed the check.

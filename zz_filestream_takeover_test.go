@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -397,6 +396,9 @@ func TestFileStream_StaleClaimOutlastsSenderStepTimeout(t *testing.T) {
 // still holds it: once a retry has taken the file over, the file is the
 // retry's.
 func TestFileStream_DiskFullLeavesATakenOverFileAlone(t *testing.T) {
+	if len(diskFullErrors) == 0 {
+		t.Skip("no disk-full error is recognized on this platform")
+	}
 	shortenStaleClaim(t, 50*time.Millisecond)
 	dir := t.TempDir()
 	f := newStreamFile(2)
@@ -411,7 +413,7 @@ func TestFileStream_DiskFullLeavesATakenOverFileAlone(t *testing.T) {
 	defer retry.Close()
 	expectResume(t, retry, f.init(), StreamChunkSize)
 
-	stalled.abandonIfDiskFull(f.id, &os.PathError{Op: "write", Path: "f", Err: syscall.ENOSPC})
+	stalled.abandonIfDiskFull(f.id, &os.PathError{Op: "write", Path: "f", Err: diskFullErrors[0]})
 
 	expectAck(t, retry, f.chunk(1))
 	expectCompleted(t, retry, f)

@@ -12,7 +12,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -153,6 +152,9 @@ func TestFileStream_RefusedWhenDiskCannotHoldIt(t *testing.T) {
 // When a write fails because the disk is full, the .partial goes: keeping it
 // holds the disk full for a resume that cannot succeed.
 func TestFileStream_DiskFullMidTransferRemovesPartial(t *testing.T) {
+	if len(diskFullErrors) == 0 {
+		t.Skip("no disk-full error is recognized on this platform")
+	}
 	dir := t.TempDir()
 	data := makePayload(StreamChunkSize)
 	id := transferIDOf(data)
@@ -185,12 +187,51 @@ func TestFileStream_DiskFullMidTransferRemovesPartial(t *testing.T) {
 	if len(partialFiles(t, dir)) != 1 {
 		t.Fatal("a non-disk-full error must keep the partial for resume")
 	}
-	sr.abandonIfDiskFull(id, fmt.Errorf("write at 0: %w", syscall.ENOSPC))
+	sr.abandonIfDiskFull(id, fmt.Errorf("write at 0: %w", diskFullErrors[0]))
 	if left := partialFiles(t, dir); len(left) != 0 {
 		t.Errorf("partial kept after disk-full: %v", left)
 	}
 	_ = cli.Close()
 	_ = srv.Close()
+}
+
+// The same through the receiver's own write path, for each error that means
+// the disk is full: the chunk is refused, the .partial deleted, the transfer
+// ended and its claim given up.
+func TestFileStream_DiskFullChunkRemovesPartial(t *testing.T) {
+	if len(diskFullErrors) == 0 {
+		t.Skip("no disk-full error is recognized on this platform")
+	}
+	for _, full := range diskFullErrors {
+		t.Run(full.Error(), func(t *testing.T) {
+			dir := t.TempDir()
+			f := newStreamFile(2)
+			sr := NewStreamReceiver(dir, nil, nil)
+			defer sr.Close()
+			expectResume(t, sr, f.init(), 0)
+			expectAck(t, sr, f.chunk(0))
+
+			prev := writePartialAt
+			writePartialAt = func(file *os.File, _ []byte, _ int64) (int, error) {
+				return 0, &os.PathError{Op: "write", Path: file.Name(), Err: full}
+			}
+			defer func() { writePartialAt = prev }()
+			expectRefused(t, sr, f.chunk(1), "write at")
+
+			if left := partialFiles(t, dir); len(left) != 0 {
+				t.Errorf("partial kept after disk-full: %v", left)
+			}
+			sr.mu.Lock()
+			_, kept := sr.transfers[f.id]
+			sr.mu.Unlock()
+			if kept {
+				t.Error("the transfer was kept after the disk filled")
+			}
+			if partialHeld(filepath.Join(dir, ".partial", fmt.Sprintf("%x", f.id))) {
+				t.Error("the abandoned transfer still holds its .partial")
+			}
+		})
+	}
 }
 
 type writeCounter struct {

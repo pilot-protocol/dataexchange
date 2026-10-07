@@ -39,7 +39,6 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -959,12 +958,16 @@ func (sr *StreamReceiver) writeAt(t *recvTransfer, off uint64, data []byte) erro
 		}
 		t.quotaBudget -= int64(len(data))
 	}
-	if _, err := t.file.WriteAt(data, int64(off)); err != nil {
+	if _, err := writePartialAt(t.file, data, int64(off)); err != nil {
 		return fmt.Errorf("write at %d: %w", off, err)
 	}
 	t.cursor += uint64(len(data))
 	return nil
 }
+
+// writePartialAt writes a chunk into a .partial. A variable so tests can make
+// the write fail.
+var writePartialAt = (*os.File).WriteAt
 
 // writeFailed answers a chunk whose write failed. A transfer whose file a
 // retry has taken over can never write again, so it is ended here rather than
@@ -1106,7 +1109,7 @@ func (sr *StreamReceiver) forget(id [transferIDLen]byte) {
 // could then store neither messages nor its own state — for the sake of a
 // resume that cannot succeed until space is freed anyway.
 func (sr *StreamReceiver) abandonIfDiskFull(id [transferIDLen]byte, werr error) {
-	if !errors.Is(werr, syscall.ENOSPC) {
+	if !isDiskFull(werr) {
 		return
 	}
 	sr.mu.Lock()
@@ -1126,6 +1129,17 @@ func (sr *StreamReceiver) abandonIfDiskFull(id [transferIDLen]byte, werr error) 
 		_ = os.Remove(t.partial)
 	}
 	t.release()
+}
+
+// isDiskFull reports whether err is a write failing for lack of space:
+// one of the platform's diskFullErrors.
+func isDiskFull(err error) bool {
+	for _, target := range diskFullErrors {
+		if errors.Is(err, target) {
+			return true
+		}
+	}
+	return false
 }
 
 // Close releases any open .partial handles (call on connection teardown).
