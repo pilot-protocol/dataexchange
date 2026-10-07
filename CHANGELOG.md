@@ -35,7 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it; two peers sending the same file (or one sender on two connections)
   therefore wrote the same file, and all but the first failed at the final
   rename. The first transfer keeps the resumable `.partial`; a concurrent one
-  gets a private file that is removed if it does not finish.
+  gets a private file that is removed if it does not finish. A sender that
+  stalls and retries still resumes: once the transfer holding the `.partial`
+  has written nothing for 10 seconds, the retry takes the file over and the
+  stalled transfer is refused any further write.
 - A file that cannot fit on the receiver's disk is refused before any byte is
   sent. The byte quota is a fixed number and can be larger than the disk, so a
   transfer ran until the disk was full, failed, and left its bytes in

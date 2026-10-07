@@ -453,7 +453,11 @@ type recvTransfer struct {
 	// private marks a .partial that only this transfer can use: another
 	// live transfer already held the content-addressed one, so this one got
 	// its own. Nothing can resume it, so it is removed if it does not finish.
-	private   bool
+	private bool
+	// claim is this transfer's hold on partial (see activePartials). A retry
+	// can take a stalled transfer's claim over; the old transfer then stops
+	// writing.
+	claim     *partialClaim
 	name      string
 	size      uint64
 	hash      [32]byte
@@ -475,35 +479,76 @@ type recvTransfer struct {
 // interleave their writes, and the second to finish would fail its rename
 // because the first already moved the file. The first transfer to arrive
 // claims the path; a concurrent one writes to a private .partial instead.
+//
+// A claim whose holder has written nothing for staleClaimAfter can be taken
+// over. That is a sender retrying after a stall: it reconnects while this
+// receiver still holds the stalled connection open (until the idle timeout,
+// minutes later). The retry takes the .partial over and resumes where the
+// stalled transfer stopped; the stalled one is refused any further write.
 var activePartials = struct {
 	sync.Mutex
-	paths map[string]struct{}
-}{paths: make(map[string]struct{})}
+	paths map[string]*partialClaim
+}{paths: make(map[string]*partialClaim)}
 
-func claimPartial(path string) bool {
+// partialClaim is one transfer's hold on a .partial path.
+type partialClaim struct {
+	lastWrite time.Time
+}
+
+// staleClaimAfter is how long a claim's holder may go without writing before
+// another transfer of the same content may take the claim over. A variable so
+// tests can shorten it.
+var staleClaimAfter = 10 * time.Second
+
+// claimPartial takes path for a new transfer. It returns nil when a live
+// transfer holds it.
+func claimPartial(path string) *partialClaim {
 	activePartials.Lock()
 	defer activePartials.Unlock()
-	if _, held := activePartials.paths[path]; held {
+	if held, ok := activePartials.paths[path]; ok && time.Since(held.lastWrite) < staleClaimAfter {
+		return nil
+	}
+	c := &partialClaim{lastWrite: time.Now()}
+	activePartials.paths[path] = c
+	return c
+}
+
+// stillHolds reports whether c is still the claim on path, and records a
+// write by its holder when it is.
+func stillHolds(path string, c *partialClaim) bool {
+	if c == nil {
+		return true // a transfer that never needed a claim
+	}
+	activePartials.Lock()
+	defer activePartials.Unlock()
+	if activePartials.paths[path] != c {
 		return false
 	}
-	activePartials.paths[path] = struct{}{}
+	c.lastWrite = time.Now()
 	return true
 }
 
-func releasePartial(path string) {
+// releasePartial gives up c's claim on path, if it still holds it.
+func releasePartial(path string, c *partialClaim) {
 	activePartials.Lock()
-	delete(activePartials.paths, path)
+	if activePartials.paths[path] == c {
+		delete(activePartials.paths, path)
+	}
 	activePartials.Unlock()
 }
 
 // release gives up t's claim on its .partial and, for a private one, removes
 // the file (a no-op once a finished transfer has renamed it into place).
 func (t *recvTransfer) release() {
-	releasePartial(t.partial)
+	releasePartial(t.partial, t.claim)
 	if t.private {
 		_ = os.Remove(t.partial)
 	}
 }
+
+// errPartialTakenOver is returned to a stalled transfer whose .partial a
+// retry of the same transfer has taken over.
+var errPartialTakenOver = errors.New("a newer transfer of this file has taken it over")
 
 // diskReserveBytes is left free on the receiving filesystem: a transfer that
 // would take the disk below it is refused at INIT, so a large file cannot
@@ -619,15 +664,15 @@ func (sr *StreamReceiver) handleInit(id [transferIDLen]byte, body []byte) *Frame
 	}
 	partial := filepath.Join(partialDir, hex.EncodeToString(id[:]))
 	private := false
+	var claim *partialClaim
 	sr.mu.Lock()
 	prior := sr.transfers[id]
 	sr.mu.Unlock()
-	switch {
-	case prior != nil:
+	if prior != nil {
 		// A second INIT for a transfer this receiver already holds: keep
 		// its .partial (and the claim on it).
-		partial, private = prior.partial, prior.private
-	case !claimPartial(partial):
+		partial, private, claim = prior.partial, prior.private, prior.claim
+	} else if claim = claimPartial(partial); claim == nil {
 		// Another live transfer is writing this content. Take a private
 		// .partial rather than share the file with it.
 		var suffix [4]byte
@@ -636,12 +681,12 @@ func (sr *StreamReceiver) handleInit(id [transferIDLen]byte, body []byte) *Frame
 		}
 		partial += "." + hex.EncodeToString(suffix[:])
 		private = true
-		claimPartial(partial)
+		claim = claimPartial(partial)
 	}
 	// fail reports a refused INIT, giving back the claim just taken.
 	fail := func(reason string) *Frame {
 		if prior == nil {
-			releasePartial(partial)
+			releasePartial(partial, claim)
 			if private {
 				_ = os.Remove(partial)
 			}
@@ -715,6 +760,7 @@ func (sr *StreamReceiver) handleInit(id [transferIDLen]byte, body []byte) *Frame
 		file:        file,
 		partial:     partial,
 		private:     private,
+		claim:       claim,
 		name:        sanitizeBase(name),
 		size:        size,
 		hash:        hash,
@@ -788,6 +834,9 @@ func (sr *StreamReceiver) handleChunk(id [transferIDLen]byte, body []byte) *Fram
 // the write if it would overrun, so a peer that lies about its declared size
 // (sends more chunk bytes than INIT promised) still cannot exceed the quota.
 func (sr *StreamReceiver) writeAt(t *recvTransfer, off uint64, data []byte) error {
+	if !stillHolds(t.partial, t.claim) {
+		return errPartialTakenOver
+	}
 	if t.quotaBudget >= 0 {
 		if int64(len(data)) > t.quotaBudget {
 			return fmt.Errorf("receiver disk quota exceeded at offset %d", off)
@@ -807,6 +856,11 @@ func (sr *StreamReceiver) handleDone(id [transferIDLen]byte) *Frame {
 	sr.mu.Unlock()
 	if t == nil {
 		return encodeComplete(id, false, "no active transfer")
+	}
+	if !stillHolds(t.partial, t.claim) {
+		// A retry of this transfer has taken the file over; it finishes it.
+		sr.forget(id)
+		return encodeComplete(id, false, errPartialTakenOver.Error())
 	}
 
 	if err := t.file.Sync(); err != nil {

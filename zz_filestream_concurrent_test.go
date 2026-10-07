@@ -4,6 +4,7 @@ package dataexchange
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"fmt"
 	"net"
 	"os"
@@ -223,5 +224,98 @@ func TestWriteFrame_SmallFrameIsOneWrite(t *testing.T) {
 		if out.Type != in.Type || !bytes.Equal(out.Payload, in.Payload) {
 			t.Errorf("%d-byte payload did not round-trip", tc.size)
 		}
+	}
+}
+
+// A sender that stalls and retries reconnects while this receiver still
+// holds the stalled connection open (until its idle timeout, minutes later).
+// The retry must resume the .partial where the stalled transfer stopped —
+// not start over in a private copy, which also left the stale .partial to
+// count against the quota and could get the retry refused outright — and
+// the stalled transfer must not write to the file again.
+func TestFileStream_RetryTakesOverAStalledTransfer(t *testing.T) {
+	prev := staleClaimAfter
+	staleClaimAfter = 50 * time.Millisecond
+	defer func() { staleClaimAfter = prev }()
+
+	dir := t.TempDir()
+	data := makePayload(3 * StreamChunkSize)
+	hash := sha256.Sum256(data)
+	var id [transferIDLen]byte
+	copy(id[:], hash[:])
+
+	send := func(sr *StreamReceiver, f *Frame) (kind byte, body []byte) {
+		t.Helper()
+		resp := sr.HandleFrame(f)
+		if resp == nil {
+			t.Fatal("no response")
+		}
+		kind, _, body, ok := decodeStreamFrame(resp)
+		if !ok {
+			t.Fatal("malformed response")
+		}
+		return kind, body
+	}
+	chunk := func(i int) *Frame {
+		return encodeChunk(id, uint64(i*StreamChunkSize), data[i*StreamChunkSize:(i+1)*StreamChunkSize])
+	}
+
+	stalled := NewStreamReceiver(dir, nil, nil)
+	defer stalled.Close()
+	if kind, _ := send(stalled, encodeInit(id, uint64(len(data)), hash, StreamChunkSize, "f.bin")); kind != streamKindInitAck {
+		t.Fatalf("first INIT answered with kind %#x", kind)
+	}
+	if kind, _ := send(stalled, chunk(0)); kind != streamKindAck {
+		t.Fatalf("first chunk answered with kind %#x", kind)
+	}
+	time.Sleep(2 * staleClaimAfter) // the sender stalls, then retries
+
+	retry := NewStreamReceiver(dir, nil, nil)
+	defer retry.Close()
+	kind, body := send(retry, encodeInit(id, uint64(len(data)), hash, StreamChunkSize, "f.bin"))
+	if kind != streamKindInitAck {
+		t.Fatalf("retry INIT answered with kind %#x", kind)
+	}
+	if off, _ := decodeOffset(body); off != StreamChunkSize {
+		t.Fatalf("retry resumes at %d, want %d: it did not take over the stalled transfer's .partial", off, StreamChunkSize)
+	}
+
+	// The stalled connection wakes up and tries to carry on: refused.
+	kind, body = send(stalled, chunk(1))
+	if kind != streamKindComplete {
+		t.Fatalf("stalled transfer's chunk answered with kind %#x, want a refusal", kind)
+	}
+	if ok, msg := decodeComplete(body); ok || !strings.Contains(msg, "taken it over") {
+		t.Fatalf("stalled transfer's chunk: ok=%v %q", ok, msg)
+	}
+
+	for i := 1; i < 3; i++ {
+		if kind, _ := send(retry, chunk(i)); kind != streamKindAck {
+			t.Fatalf("retry chunk %d answered with kind %#x", i, kind)
+		}
+	}
+	kind, body = send(retry, encodeStreamFrame(streamKindDone, id, nil))
+	if ok, msg := decodeComplete(body); kind != streamKindComplete || !ok {
+		t.Fatalf("retry DONE: kind %#x ok=%v %q", kind, ok, msg)
+	}
+	entries, _ := os.ReadDir(dir)
+	files := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		files++
+		got, _ := os.ReadFile(filepath.Join(dir, e.Name()))
+		if !bytes.Equal(got, data) {
+			t.Fatalf("%s does not match what was sent", e.Name())
+		}
+	}
+	if files != 1 {
+		t.Fatalf("%d files received, want 1", files)
+	}
+	stalled.Close()
+	retry.Close()
+	if left := partialFiles(t, dir); len(left) > 0 {
+		t.Fatalf("partial files left behind: %v", left)
 	}
 }
